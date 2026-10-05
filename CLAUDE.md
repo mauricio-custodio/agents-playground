@@ -5,4 +5,5 @@ This is a learning project. The goal is for the owner to understand the Claude M
 - Follow the roadmap in README.md one stage at a time and tick a stage off when it's done.
 - Code teaches: explain each new API concept in a short comment at the point it's used. Keep comments on what's new in that stage, not on things covered earlier.
 - Keep changes per stage small enough that the diff from the previous stage shows exactly what the new concept adds.
+- One concept per module under `src/` (see the Code layout table in README.md). A new stage usually adds a module and wires it into `src/index.ts`; update the layout table and the file list at the top of `index.ts` when it does.
 - TypeScript with `@anthropic-ai/sdk`, run with `tsx`. The API key comes from `.env`, which is gitignored. Never print or commit it.

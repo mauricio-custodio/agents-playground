@@ -10,6 +10,19 @@ cp .env.example .env   # then paste your API key into .env
 npm start -- "your question"
 ```
 
+## Code layout
+
+| File | What it covers |
+|---|---|
+| `src/index.ts` | The REPL: reads commands and calls the modules below |
+| `src/client.ts` | The Anthropic client, the model, refusal fallbacks |
+| `src/chat.ts` | Chat turns: history, streaming, thinking |
+| `src/prompt.ts` | System prompt, grounding, prompt caching |
+| `src/data.ts` | Loads `data/routes.json` |
+| `src/audit.ts` | `/audit`: structured output with Zod |
+| `src/settings.ts` | Effort and raw view, changed by commands |
+| `src/output.ts` | Printing raw JSON, usage and cost |
+
 ## Roadmap
 
 Each stage builds on the one before it. The point is to see what each layer adds and what it costs you to own.
