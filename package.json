@@ -1,0 +1,19 @@
+{
+  "name": "agents-playground",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Learning the Claude Messages API and Managed Agents by building one project end to end",
+  "type": "module",
+  "scripts": {
+    "start": "tsx --env-file-if-exists=.env src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
