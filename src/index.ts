@@ -1,25 +1,22 @@
-// Stage 4: grounding and prompt caching.
+// Stage 5: structured output.
 //
-// Grounding: Claude now answers from a dataset, data/routes.json (about
-// 5,500 tokens), sent in the system prompt, instead of from general knowledge.
-//
-// Caching: that dataset is resent with every request, just like the history.
-// Prompt caching lets the API reuse the work it already did on an identical
-// start of a prompt. The first request writes the cache (1.25x the normal
-// input price); requests in the next 5 minutes read it at 0.05x, and every
-// read restarts the 5 minutes.
-//
-// The prefix rule: the cache matches the prompt byte for byte from the start,
-// in the order tools → system → messages. The first difference ends the
-// match, and everything from there on is processed at full price again.
+// Chat answers are prose for a person to read. /audit asks for data a
+// program can use instead. You describe the shape with a Zod schema; the SDK
+// turns it into a JSON Schema and sends it as output_config.format; and the
+// API constrains Claude's output to valid JSON for that schema. parse() then
+// checks the JSON against the Zod schema and hands you a typed object, so
+// your code can sort, count and color the problems without parsing any text.
 //
 // Run:  npm start   then type.
+//   /audit           lists every problem in the data as structured JSON
 //   /effort <level>  low | medium | high | xhigh | max (starts at low)
 //   /raw             toggles printing the request JSON and every stream event (on by default)
 //   /history         shows a summary of what gets sent
 //   exit             quits (or Ctrl+D)
 
 import Anthropic from "@anthropic-ai/sdk";
+import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
+import { z } from "zod";
 import { readFileSync } from "node:fs";
 import * as readline from "node:readline";
 import { styleText } from "node:util";
@@ -55,12 +52,27 @@ const system: Anthropic.Beta.BetaTextBlockParam[] = [
   },
 ];
 
+// The shape /audit asks for. Each .describe() becomes a "description" in the
+// JSON Schema the API receives, so it works as an instruction for that field.
+// Enums limit a field to fixed values your code can branch on.
+const Problem = z.object({
+  kind: z.enum(["capacity", "time_window", "driver_shift", "routing", "unassigned", "other"]),
+  severity: z.enum(["high", "medium", "low"]),
+  route_id: z.string().nullable().describe("Route ID, or null for an unassigned delivery"),
+  stop_ids: z.array(z.string()).describe("Stops involved; empty if the problem is route-wide"),
+  summary: z.string().describe("One sentence"),
+  evidence: z.string().describe("The numbers from the data that show the problem"),
+  suggested_fix: z.string().describe("One concrete change a dispatcher could make"),
+});
+const AuditReport = z.object({ problems: z.array(Problem) });
+type AuditReport = z.infer<typeof AuditReport>; // the TypeScript type, derived from the schema
+
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = (typeof EFFORTS)[number];
 
 // The conversation history. It lives in your process; the API never stores it.
 const messages: Anthropic.Beta.BetaMessageParam[] = [];
-let conversationCostUsd = 0;
+let sessionCostUsd = 0;
 let showRaw = true;
 let effort: Effort = "low";
 
@@ -69,7 +81,7 @@ let inputClosed = false; // Ctrl+D can close input while a request is in flight
 rl.on("close", () => (inputClosed = true));
 const { routes, unassigned } = JSON.parse(routeData);
 console.log(`Route analyst. Loaded ${routes.length} routes and ${unassigned.length} unassigned deliveries.`);
-console.log("Commands: /effort <level>, /raw, /history, exit.");
+console.log("Commands: /audit, /effort <level>, /raw, /history, exit.");
 rl.setPrompt("\nyou › ");
 rl.prompt();
 
@@ -77,6 +89,7 @@ for await (const line of rl) {
   const text = line.trim();
   if (text === "exit") break;
   else if (text === "/history") printHistory();
+  else if (text === "/audit") await audit();
   else if (text === "/raw") console.log(`raw view ${(showRaw = !showRaw) ? "on" : "off"}`);
   else if (text.startsWith("/effort")) setEffort(text.split(/\s+/)[1]);
   else if (text) await turn(text);
@@ -187,29 +200,134 @@ async function turn(userText: string) {
   // get a 400 error.
   messages.push({ role: "assistant", content: contentForHistory(response.content) });
 
-  // With caching, the prompt's tokens are split three ways. input_tokens is
-  // only the part after the last cache hit, not the whole prompt.
-  const { input_tokens, output_tokens } = response.usage;
-  const cacheRead = response.usage.cache_read_input_tokens ?? 0;
-  const cacheWrite = response.usage.cache_creation_input_tokens ?? 0;
-  const promptTokens = cacheRead + cacheWrite + input_tokens;
-
-  // Opus 5.5 prices per 1M tokens: input $4, cache write (5 minutes) $5,
-  // cache read $0.20, output $20.
-  const costUsd = (input_tokens * 4 + cacheWrite * 5 + cacheRead * 0.2 + output_tokens * 20) / 1_000_000;
-  const uncachedUsd = (promptTokens * 4 + output_tokens * 20) / 1_000_000;
-  conversationCostUsd += costUsd;
-
   const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
   const timing = firstOutputAt
     ? `${seconds(firstOutputAt - startedAt)} to first output, ${seconds(finishedAt - startedAt)} total`
     : `${seconds(finishedAt - startedAt)} total`;
   const cutOff = response.stop_reason === "max_tokens" ? " · CUT OFF (max_tokens)" : "";
   console.log(`\n[turn ${messages.length / 2} · effort ${effort} · ${timing}${cutOff}]`);
+  printUsage(response.usage);
+}
+
+// /audit is a separate one-question conversation: its answer isn't added to
+// the chat history. It sends the same system prompt as the chat, so the
+// dataset is still read from the cache.
+async function audit() {
+  const request = {
+    model: "claude-opus-5-5",
+
+    // Not streamed: the JSON is only usable once it's complete. Without
+    // streaming, keep max_tokens moderate so the request stays within the
+    // SDK's HTTP timeout.
+    max_tokens: 16000,
+
+    output_config: {
+      effort,
+      // The schema the response must follow. With /raw on, look for it in
+      // the request: this is the JSON Schema generated from the Zod schema.
+      // The SDK's converter keeps only some keywords. Others, like the enums
+      // here, become a hint inside "description". So the API guarantees valid
+      // JSON with the right fields and types, and parse() enforces the enum
+      // values afterwards with Zod.
+      format: betaZodOutputFormat(AuditReport),
+    },
+    thinking: { type: "adaptive", display: "summarized" },
+    system,
+    messages: [
+      {
+        role: "user",
+        content:
+          "Audit today's plan. List every problem you find in the data: vehicle " +
+          "capacity, time windows, driver shifts, routing, and unassigned deliveries.",
+      },
+    ],
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default",
+    // `satisfies` checks the shape but keeps the exact type of `format`, which
+    // is how parse() knows parsed_output is an AuditReport.
+  } satisfies Anthropic.Beta.Messages.MessageCreateParamsNonStreaming;
+
+  if (showRaw) {
+    const { betas, ...body } = request;
+    printRaw(`→ POST /v1/messages   anthropic-beta: ${betas.join(",")}`, body);
+  }
+
+  console.log(styleText("dim", `\nauditing at effort ${effort}…`));
+  const startedAt = performance.now();
+  let response;
+  try {
+    // parse() is create() plus a final step: it validates the JSON text
+    // against the Zod schema and puts the typed result in parsed_output.
+    response = await client.beta.messages.parse(request);
+  } catch (error) {
+    if (error instanceof Anthropic.APIError) {
+      console.error(`\nAPI error: ${error.message}`);
+      return;
+    }
+    // Not an HTTP error: the JSON didn't validate, for example because the
+    // output was cut off or a refusal stopped it partway.
+    if (error instanceof Anthropic.AnthropicError) {
+      console.error(`\n${error.message}`);
+      return;
+    }
+    throw error;
+  }
+
+  if (showRaw) printRaw("← 200 response body", response);
+
+  // Always check stop_reason before using the content.
+  if (response.stop_reason === "refusal") {
+    console.error("\nDeclined:", response.stop_details);
+    return;
+  }
+  const report = response.parsed_output; // AuditReport | null, fully typed
+  if (!report) {
+    console.error(`\nNo structured output (stop_reason: ${response.stop_reason}).`);
+    return;
+  }
+
+  printReport(report);
+  console.log(`\n[audit · effort ${effort} · ${((performance.now() - startedAt) / 1000).toFixed(1)}s]`);
+  printUsage(response.usage);
+}
+
+// Everything here is plain code over typed fields: sorting by severity,
+// counting, coloring. None of it would be reliable on free-form text.
+function printReport(report: AuditReport) {
+  const rank = { high: 0, medium: 1, low: 2 } as const;
+  const color = { high: "red", medium: "yellow", low: "dim" } as const;
+  const problems = report.problems.toSorted((a, b) => rank[a.severity] - rank[b.severity]);
+
+  for (const p of problems) {
+    const where = [p.route_id ?? "unassigned", ...p.stop_ids].join(" ");
+    console.log(`\n${styleText(color[p.severity], p.severity.toUpperCase().padEnd(6))} ${p.kind.padEnd(12)} ${where}`);
+    console.log(`       ${p.summary}`);
+    console.log(styleText("dim", `       evidence: ${p.evidence}`));
+    console.log(`       fix: ${p.suggested_fix}`);
+  }
+
+  const count = (s: keyof typeof rank) => problems.filter((p) => p.severity === s).length;
+  console.log(`\n${problems.length} problems: ${count("high")} high, ${count("medium")} medium, ${count("low")} low`);
+}
+
+function printUsage(usage: Anthropic.Beta.BetaUsage) {
+  // With caching, the prompt's tokens are split three ways. input_tokens is
+  // only the part after the last cache hit, not the whole prompt.
+  const { input_tokens, output_tokens } = usage;
+  const cacheRead = usage.cache_read_input_tokens ?? 0;
+  const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+  const promptTokens = cacheRead + cacheWrite + input_tokens;
+
+  // Opus 5.5 prices per 1M tokens: input $4, cache write (5 minutes) $5,
+  // cache read $0.20, output $20.
+  const costUsd = (input_tokens * 4 + cacheWrite * 5 + cacheRead * 0.2 + output_tokens * 20) / 1_000_000;
+  const uncachedUsd = (promptTokens * 4 + output_tokens * 20) / 1_000_000;
+  sessionCostUsd += costUsd;
+
   console.log(
     `[prompt ${promptTokens} = ${cacheRead} cache read + ${cacheWrite} cache write + ${input_tokens} uncached · ` +
       `${output_tokens} out · ~$${costUsd.toFixed(4)} (~$${uncachedUsd.toFixed(4)} without caching) · ` +
-      `conversation ~$${conversationCostUsd.toFixed(4)}]`,
+      `session ~$${sessionCostUsd.toFixed(4)}]`,
   );
 }
 
