@@ -19,7 +19,7 @@ Each stage builds on the one before it. The point is to see what each layer adds
 - [x] **1. First call**: request shape, content blocks, `stop_reason`, token usage and cost
 - [x] **2. Chat loop**: multi-turn REPL with a system prompt. The API is stateless, so you keep the history.
 - [x] **3. Streaming + thinking**: stream tokens as they arrive, show thinking summaries, tune effort
-- [ ] **4. Grounding + caching**: put a route dataset in the prompt, use prompt caching, watch `cache_read_input_tokens`
+- [x] **4. Grounding + caching**: put a route dataset in the prompt, use prompt caching, watch `cache_read_input_tokens`
 - [ ] **5. Structured output**: get typed JSON back, validated against a Zod schema
 
 ### Part 2: You run the agent loop

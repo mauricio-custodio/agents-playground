@@ -1,11 +1,17 @@
-// Stage 3: streaming and visible thinking.
+// Stage 4: grounding and prompt caching.
 //
-// Until now the whole answer arrived in one piece after Claude finished.
-// With streaming, the API sends events while the response is being
-// generated: message_start, then for each content block a start, many
-// deltas and a stop, then message_delta (stop_reason and final usage) and
-// message_stop. The SDK parses the events and also assembles the final
-// message for you, so the history works exactly as in stage 2.
+// Grounding: Claude now answers from a dataset, data/routes.json (about
+// 5,500 tokens), sent in the system prompt, instead of from general knowledge.
+//
+// Caching: that dataset is resent with every request, just like the history.
+// Prompt caching lets the API reuse the work it already did on an identical
+// start of a prompt. The first request writes the cache (1.25x the normal
+// input price); requests in the next 5 minutes read it at 0.05x, and every
+// read restarts the 5 minutes.
+//
+// The prefix rule: the cache matches the prompt byte for byte from the start,
+// in the order tools → system → messages. The first difference ends the
+// match, and everything from there on is processed at full price again.
 //
 // Run:  npm start   then type.
 //   /effort <level>  low | medium | high | xhigh | max (starts at low)
@@ -14,6 +20,7 @@
 //   exit             quits (or Ctrl+D)
 
 import Anthropic from "@anthropic-ai/sdk";
+import { readFileSync } from "node:fs";
 import * as readline from "node:readline";
 import { styleText } from "node:util";
 
@@ -24,11 +31,29 @@ const client = new Anthropic();
 // The system prompt sets Claude's role and rules for the whole conversation.
 // It's a separate field, not a message, and like the history it's sent with
 // every request.
-const system =
-  "You are a route analyst for a small delivery company. You help dispatchers " +
-  "plan and review delivery routes: stop order, time windows, drive time, " +
-  "vehicle capacity. Answer briefly and concretely. If a question needs data " +
-  "you don't have, say what data you'd need.";
+const instructions =
+  "You are a route analyst for Rota Express, a delivery company. Dispatchers " +
+  "ask you about today's planned routes. The route data below is your source " +
+  "of truth: answer from it, refer to routes, vehicles and stops by ID, and " +
+  "show the numbers behind each conclusion. If the data doesn't answer a " +
+  "question, say so instead of guessing. Answer briefly and concretely.";
+
+const routeData = readFileSync(new URL("../data/routes.json", import.meta.url), "utf8");
+
+// The system prompt can be a plain string or a list of text blocks. Blocks
+// let you put a cache marker at a specific point.
+const system: Anthropic.Beta.BetaTextBlockParam[] = [
+  { type: "text", text: instructions },
+  {
+    type: "text",
+    // XML-style tags tell Claude where the data starts and ends.
+    text: `<route_data>\n${routeData}</route_data>`,
+    // Breakpoint 1: cache the prompt up to and including this block. The
+    // instructions and the dataset never change, so every request reads them
+    // from the cache, even when the conversation part misses.
+    cache_control: { type: "ephemeral" },
+  },
+];
 
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 type Effort = (typeof EFFORTS)[number];
@@ -42,7 +67,9 @@ let effort: Effort = "low";
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 let inputClosed = false; // Ctrl+D can close input while a request is in flight
 rl.on("close", () => (inputClosed = true));
-console.log("Route analyst. Commands: /effort <level>, /raw, /history, exit.");
+const { routes, unassigned } = JSON.parse(routeData);
+console.log(`Route analyst. Loaded ${routes.length} routes and ${unassigned.length} unassigned deliveries.`);
+console.log("Commands: /effort <level>, /raw, /history, exit.");
 rl.setPrompt("\nyou › ");
 rl.prompt();
 
@@ -69,7 +96,8 @@ async function turn(userText: string) {
     max_tokens: 64000,
 
     // Opus 5.5 always thinks; effort sets how much. Change it with /effort
-    // and compare the thinking, output tokens and time.
+    // and compare the thinking, output tokens and time. Changing it also
+    // invalidates the cached history, so expect a cache write on that turn.
     output_config: { effort },
 
     // Thinking happens, and is billed, whatever `display` says. "summarized"
@@ -77,8 +105,13 @@ async function turn(userText: string) {
     // empty thinking text you saw in stage 2.
     thinking: { type: "adaptive", display: "summarized" },
 
-    system,
+    system, // instructions + dataset: the same bytes on every request
     messages, // the full history, every time
+
+    // Breakpoint 2, automatic: the API puts a marker on the last block of the
+    // request, so it moves forward as the conversation grows. Each turn then
+    // also reads the previous turns from the cache and writes only what's new.
+    cache_control: { type: "ephemeral" },
 
     // A safety classifier can decline a request (HTTP 200 with
     // stop_reason "refusal"). With fallbacks on, the API retries on another
@@ -154,8 +187,17 @@ async function turn(userText: string) {
   // get a 400 error.
   messages.push({ role: "assistant", content: contentForHistory(response.content) });
 
+  // With caching, the prompt's tokens are split three ways. input_tokens is
+  // only the part after the last cache hit, not the whole prompt.
   const { input_tokens, output_tokens } = response.usage;
-  const costUsd = (input_tokens * 4 + output_tokens * 20) / 1_000_000; // Opus 5.5: $4 / $20 per 1M tokens
+  const cacheRead = response.usage.cache_read_input_tokens ?? 0;
+  const cacheWrite = response.usage.cache_creation_input_tokens ?? 0;
+  const promptTokens = cacheRead + cacheWrite + input_tokens;
+
+  // Opus 5.5 prices per 1M tokens: input $4, cache write (5 minutes) $5,
+  // cache read $0.20, output $20.
+  const costUsd = (input_tokens * 4 + cacheWrite * 5 + cacheRead * 0.2 + output_tokens * 20) / 1_000_000;
+  const uncachedUsd = (promptTokens * 4 + output_tokens * 20) / 1_000_000;
   conversationCostUsd += costUsd;
 
   const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
@@ -163,10 +205,11 @@ async function turn(userText: string) {
     ? `${seconds(firstOutputAt - startedAt)} to first output, ${seconds(finishedAt - startedAt)} total`
     : `${seconds(finishedAt - startedAt)} total`;
   const cutOff = response.stop_reason === "max_tokens" ? " · CUT OFF (max_tokens)" : "";
+  console.log(`\n[turn ${messages.length / 2} · effort ${effort} · ${timing}${cutOff}]`);
   console.log(
-    `\n[turn ${messages.length / 2} · effort ${effort} · ${timing} · ` +
-      `${input_tokens} in / ${output_tokens} out · ~$${costUsd.toFixed(4)} ` +
-      `(conversation ~$${conversationCostUsd.toFixed(4)})${cutOff}]`,
+    `[prompt ${promptTokens} = ${cacheRead} cache read + ${cacheWrite} cache write + ${input_tokens} uncached · ` +
+      `${output_tokens} out · ~$${costUsd.toFixed(4)} (~$${uncachedUsd.toFixed(4)} without caching) · ` +
+      `conversation ~$${conversationCostUsd.toFixed(4)}]`,
   );
 }
 
@@ -187,8 +230,12 @@ function setEffort(value: string | undefined) {
 }
 
 function printRaw(label: string, value: unknown) {
+  // Very long strings, like the dataset, are cut short on screen only. The
+  // API always receives them in full.
+  const shorten = (_key: string, v: unknown) =>
+    typeof v === "string" && v.length > 2000 ? `${v.slice(0, 300)} … [${v.length - 300} more characters not shown]` : v;
   console.log(styleText("cyan", `\n${label}`));
-  console.log(styleText("dim", JSON.stringify(value, null, 2)));
+  console.log(styleText("dim", JSON.stringify(value, shorten, 2)));
 }
 
 function printHistory() {
