@@ -7,8 +7,21 @@ Learning the Claude API hands-on by building one project end to end: a **route a
 ```bash
 npm install
 cp .env.example .env   # then paste your API key into .env
-npm start -- "your question"
+npm start              # then type a question
 ```
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| any text | Asks the route analyst a question |
+| `/audit` | Lists every problem in the data as structured JSON (stage 5) |
+| `/effort <level>` | Sets effort: `low` (the default), `medium`, `high`, `xhigh`, `max` |
+| `/raw` | Shows or hides the exact request JSON and every stream event (off by default) |
+| `/history` | Lists the messages that get sent with every request |
+| `exit` | Quits (or Ctrl+D) |
+
+After every answer, a status line shows the requests made, the timing, the prompt split into cache read, cache write and uncached tokens, and the estimated cost.
 
 ## Code layout
 
@@ -49,3 +62,102 @@ Each stage builds on the one before it. The point is to see what each layer adds
 - [ ] **10. Files in, files out**: upload the dataset, have the agent analyze it in its sandbox and return a report or chart
 - [ ] **11. Outcomes**: give the agent a rubric and let a grader send its work back until it passes
 - [ ] **12. Going further**: memory across sessions, a scheduled nightly report, multiple agents
+
+## Trying each stage
+
+Every feature stays in the app, so stages 2 to 8 can be tried on `main`. Stage 1, and a couple of experiments marked below, need the code as it was at that stage. Each stage is a git tag:
+
+```bash
+git checkout stage-1
+```
+
+```bash
+git checkout main
+```
+
+To see exactly what a stage added, diff it against the one before:
+
+```bash
+git diff stage-3 stage-4
+```
+
+Between stage 5 and stage 6 there's a refactor commit (`26d4d1d`) that split the code into modules, so `git diff 26d4d1d stage-6` shows only what stage 6 added.
+
+Questions cost a few cents each at `/effort low`. The status line after each answer shows the exact amount.
+
+### The answer key
+
+The dataset has five problems built in. Use them to check whether Claude finds them:
+
+| Route | Problem |
+|---|---|
+| R1 | Ana's shift ends at 13:30, but the planned return is 14:03 (33 minutes over) |
+| R2 | VAN-02 carries 815 kg, over its 800 kg capacity |
+| R3 | S302 is planned for 09:12, but its window closes at 09:00. Visiting S302 before S301 fixes it |
+| R4 | S404 is in Moema, across the city from the rest of the northern route. R4 drives about 83.5 km; without S404, about 56.6 km |
+| Unassigned | S501 (no van with room), S502 (address couldn't be geocoded), S503 (window ends before any route can reach it) |
+
+### Stage 1: first call
+
+Needs `git checkout stage-1`.
+
+- Run `npm start -- "What makes a delivery route efficient?"`.
+- Change `effort` in `src/index.ts` to `"low"`, then `"high"`, and compare `tokens` and `cost`.
+
+**Look for:** `blocks: thinking, text`. There's a thinking block even though its text is empty: Opus 5.5 always reasons before answering, and the reasoning is billed as output tokens.
+
+### Stage 2: chat loop
+
+- Ask a question, then a follow-up that only makes sense in context, like "What if one van breaks down?".
+- Type `/history` after a couple of turns.
+- Turn on `/raw` and watch the `messages` array in the request grow by your question and Claude's full reply on each turn.
+- Change the instructions in `src/prompt.ts`, for example to "Always answer in Portuguese", and restart. The system prompt applies to every turn.
+- On `stage-2`: comment out the `messages.push({ role: "assistant", ... })` line in `src/index.ts`. Claude then sees your questions but none of its own answers.
+
+**Look for:** input tokens grow every turn, even for short questions, because the whole history is resent. In `/raw`, the thinking block has empty text but a long `signature`: Claude's reasoning in encrypted form, which is why the block has to go back unchanged.
+
+### Stage 3: streaming and thinking
+
+- Ask the same planning question at `/effort low`, then at `/effort high`. Compare the thinking summary, output tokens and total time.
+- Ask for something long, like "Write a checklist for onboarding a new driver", and compare "to first output" with "total" in the status line.
+- With `/raw` on, find the `signature_delta` that closes each thinking block, and the `message_delta` that carries `stop_reason` and the final usage.
+
+**Look for:** the total time is about the same as without streaming, but you start reading much sooner.
+
+### Stage 4: grounding and caching
+
+- Ask two questions in a row. The first writes the instructions, tools and dataset to the cache (several thousand tokens of cache write); the second reads them back (cache read), with only a few uncached tokens.
+- Type `exit`, run `npm start` again, and ask something within 5 minutes. The first turn now reads from the cache: it's stored on Anthropic's side, not in your program.
+- Change `/effort` mid-conversation, or wait more than 5 minutes between questions, and watch the cache writes jump.
+
+**Look for:** the "without caching" cost next to the real one in the status line.
+
+### Stage 5: structured output
+
+- Run `/audit` at `/effort low`, then at `/effort high`, and compare the results with the answer key.
+- With `/raw` on, run `/audit` and read `output_config.format` in the request: the JSON Schema generated from the Zod schema. The enums appear only as hints in `description`, so the Zod check afterwards is what enforces them.
+- Add a field to the schema in `src/audit.ts`, for example `estimated_minutes_lost: z.number()`, and run `/audit` again.
+
+**Look for:** `/audit` sends no tools, so its prompt starts differently from the chat's, and its first run writes a cache entry of its own.
+
+### Stages 6 and 7: tools
+
+- "How many km does R4 drive, and why so far?" Claude should call `evaluate_route` and `distance`, and point to S404 (15.7 km from the depot).
+- "Fix R3's late stop." Watch Claude try stop orders with `evaluate_route` until nothing is late. The expected fix is visiting S302 before S301.
+- "Can S501 fit on any route?" This takes several simulations, possibly in parallel.
+- Type `/history` to see the `tool_use` and `tool_result` messages, and turn on `/raw` to see the exact JSON each way.
+
+**Look for:** the number of requests in the turn's status line. Each round of tool calls is another request, each with its own cost line. Stage 7 behaves the same as stage 6; to compare the hand-written loop with the tool runner:
+
+```bash
+git diff stage-6 stage-7 -- src/chat.ts src/tools.ts
+```
+
+### Stage 8: server tools
+
+- "Chart each van's load against its capacity." Python runs in Anthropic's sandbox, and the chart is saved as a PNG in `outputs/`.
+- "Is anything happening in São Paulo today that could slow deliveries?" This uses web search, at $0.01 per search. The dataset's service date is 2026-10-06.
+- "Using Python, find the two stops furthest apart." Then ask a follow-up that uses files from that answer: the container, and its files, carry over between turns.
+- Type `/history` to see the `container_upload` block in your first message and the `server_tool_use` and result blocks.
+
+**Look for:** server tools never stop the turn with `tool_use`. The call and its result arrive together in the same response. The first question uploads `routes.json` through the Files API; it stays in your Anthropic workspace and is reused on later runs.
