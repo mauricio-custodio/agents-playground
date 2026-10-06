@@ -6,6 +6,7 @@
 //   client.ts    the client, the model, and refusal fallbacks (stage 1)
 //   chat.ts      history, streaming, thinking (stages 2-3) and the tool loop (stages 6-7)
 //   tools.ts     the tools Claude can call, as betaZodTool definitions (stages 6-7)
+//   server-tools.ts  code execution and web search, run by Anthropic (stage 8)
 //   prompt.ts    the system prompt and prompt caching (stage 4)
 //   data.ts      loads data/routes.json (stage 4)
 //   audit.ts     /audit, structured output with Zod (stage 5)

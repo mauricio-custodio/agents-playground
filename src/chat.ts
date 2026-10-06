@@ -1,6 +1,7 @@
 // Chat turns: the conversation history (stage 2), streaming and visible
 // thinking (stage 3), caching the growing history (stage 4), and the tool
-// loop (stage 6), now run by the SDK's tool runner (stage 7).
+// loop (stage 6), now run by the SDK's tool runner (stage 7), with server
+// tools alongside your own (stage 8).
 //
 // The API is stateless: it doesn't remember anything between calls. A
 // "conversation" is an array of messages that you keep and send in full on
@@ -15,8 +16,16 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { styleText } from "node:util";
 import { client, fallbackParams, MODEL } from "./client.ts";
-import { printRequest, printStreamEvents, printToolResults, printUsage, seconds } from "./output.ts";
+import {
+  printRequest,
+  printServerToolBlock,
+  printStreamEvents,
+  printToolResults,
+  printUsage,
+  seconds,
+} from "./output.ts";
 import { system } from "./prompt.ts";
+import { container, rememberContainer, saveOutputFiles, serverTools, uploadRouteData } from "./server-tools.ts";
 import { settings } from "./settings.ts";
 import { tools } from "./tools.ts";
 
@@ -31,6 +40,23 @@ const MAX_ROUNDS = 10;
 export async function turn(userText: string) {
   const timing = { startedAt: performance.now(), firstOutputAt: undefined as number | undefined };
   let rounds = 0;
+
+  // A message's content can be a list of blocks instead of a string. The
+  // first question also carries the dataset file into the code container.
+  let content: Anthropic.Beta.BetaMessageParam["content"] = userText;
+  if (messages.length === 0) {
+    try {
+      const fileId = await uploadRouteData();
+      content = [
+        { type: "text", text: userText },
+        { type: "container_upload", file_id: fileId },
+      ];
+    } catch (error) {
+      if (!(error instanceof Anthropic.APIError)) throw error;
+      console.error(`\nCouldn't upload the dataset: ${error.message}`);
+      return;
+    }
+  }
 
   // The tool runner is the stage 6 loop, packaged by the SDK. It sends a
   // request; if Claude asked for tools, it runs them (in parallel), sends all
@@ -57,10 +83,15 @@ export async function turn(userText: string) {
 
     // The tools Claude may ask for. tool_choice defaults to "auto": Claude
     // decides whether to call any. (Opus 5.5 doesn't allow forcing a call.)
-    tools,
+    // Your tools and server tools go in the same list; the runner only runs
+    // yours.
+    tools: [...tools, ...serverTools],
+
+    // The code container from earlier turns, if there is one.
+    container: container.id,
 
     system, // instructions + dataset: the same bytes on every request
-    messages: [...messages, { role: "user", content: userText }],
+    messages: [...messages, { role: "user", content }],
 
     // Breakpoint 2, automatic: the API puts a marker on the last block of the
     // request, so it moves forward as the conversation grows. Each turn then
@@ -87,14 +118,25 @@ export async function turn(userText: string) {
         }
 
         const events: Anthropic.Beta.Messages.BetaRawMessageStreamEvent[] = [];
+        const blockTypes: string[] = [];
         for await (const event of stream) {
           if (settings.showRaw) events.push(event);
-          showEvent(event, timing);
+          if (event.type === "content_block_start") blockTypes[event.index] = event.content_block.type;
+          showEvent(event, timing, blockTypes);
+          // Server tool blocks are printed whole once they're complete, taken
+          // from the message the stream has assembled so far.
+          if (event.type === "content_block_stop") {
+            const block = stream.currentMessage?.content[event.index];
+            if (block) printServerToolBlock(block);
+          }
         }
         const message = await stream.finalMessage();
         process.stdout.write("\n");
         if (settings.showRaw) printStreamEvents(events);
         printUsage(message.usage);
+
+        rememberContainer(message);
+        for (const file of await saveOutputFiles(message)) console.log(styleText("green", `saved ${file}`));
 
         // Stepping in: after a mid-answer fallback, hand the runner the
         // cleaned-up response instead. pushMessages() tells it you've taken
@@ -136,7 +178,9 @@ export async function turn(userText: string) {
     console.error("\nDeclined, so discard any partial answer above:", final.stop_details);
     return;
   }
-  if (final.stop_reason === "tool_use") {
+  // "pause_turn" means a server tool loop was still running. The runner
+  // resumes those, but each resume counts toward max_iterations.
+  if (final.stop_reason === "tool_use" || final.stop_reason === "pause_turn") {
     console.error(`\nStopped after ${MAX_ROUNDS} requests without a final answer, so this turn was dropped.`);
     return;
   }
@@ -160,10 +204,14 @@ export async function turn(userText: string) {
   const firstOutput = timing.firstOutputAt ? `${seconds(timing.firstOutputAt - timing.startedAt)} to first output, ` : "";
   const total = seconds(performance.now() - timing.startedAt);
   const cutOff = final.stop_reason === "max_tokens" ? " · CUT OFF (max_tokens)" : "";
-  console.log(`\n[turn ${turnCount} · effort ${settings.effort} · ${rounds} requests · ${firstOutput}${total} total${cutOff}]`);
+  console.log(`\n[turn ${turnCount} · effort ${settings.effort} · ${rounds} request${rounds === 1 ? "" : "s"} · ${firstOutput}${total} total${cutOff}]`);
 }
 
-function showEvent(event: Anthropic.Beta.Messages.BetaRawMessageStreamEvent, timing: { firstOutputAt?: number }) {
+function showEvent(
+  event: Anthropic.Beta.Messages.BetaRawMessageStreamEvent,
+  timing: { firstOutputAt?: number },
+  blockTypes: string[],
+) {
   if (event.type === "content_block_start") {
     const block = event.content_block;
     if (block.type === "thinking") process.stdout.write(styleText("dim", "\nthinking › "));
@@ -177,7 +225,10 @@ function showEvent(event: Anthropic.Beta.Messages.BetaRawMessageStreamEvent, tim
     if (event.delta.type === "thinking_delta") process.stdout.write(styleText("dim", event.delta.thinking));
     if (event.delta.type === "text_delta") process.stdout.write(event.delta.text);
     // A tool's input arrives as fragments of JSON while Claude writes it.
-    if (event.delta.type === "input_json_delta") process.stdout.write(styleText("dim", event.delta.partial_json));
+    // Server tool inputs too, but those are printed whole when they finish.
+    if (event.delta.type === "input_json_delta" && blockTypes[event.index] === "tool_use") {
+      process.stdout.write(styleText("dim", event.delta.partial_json));
+    }
   }
 }
 

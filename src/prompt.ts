@@ -25,8 +25,12 @@ const instructions =
   "of truth: answer from it, refer to routes, vehicles and stops by ID, and " +
   "show the numbers behind each conclusion. Use the tools for distances, " +
   "timings and totals, and to check a fix before recommending it, instead of " +
-  "calculating them yourself. If the data doesn't answer a question, say so " +
-  "instead of guessing. Answer briefly and concretely.";
+  "calculating them yourself. The same data is a JSON file in your code " +
+  "execution sandbox: use Python there for charts (save them as PNG files) " +
+  "and for analysis across many stops. Use web search only for real-world " +
+  "conditions in São Paulo on the service date, such as traffic, weather or " +
+  "events. If the data doesn't answer a question, say so instead of " +
+  "guessing. Answer briefly and concretely.";
 
 // The system prompt can be a plain string or a list of text blocks. Blocks
 // let you put a cache marker at a specific point.

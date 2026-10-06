@@ -18,6 +18,7 @@ npm start -- "your question"
 | `src/client.ts` | The Anthropic client, the model, refusal fallbacks |
 | `src/chat.ts` | Chat turns: history, streaming, thinking, the tool runner |
 | `src/tools.ts` | Tools Claude can call (`distance`, `evaluate_route`), defined with `betaZodTool` |
+| `src/server-tools.ts` | Server tools (code execution, web search), the Files API upload, and saving charts to `outputs/` |
 | `src/prompt.ts` | System prompt, grounding, prompt caching |
 | `src/data.ts` | Loads `data/routes.json` |
 | `src/audit.ts` | `/audit`: structured output with Zod |
@@ -40,7 +41,7 @@ Each stage builds on the one before it. The point is to see what each layer adds
 
 - [x] **6. Tools, manual loop**: give Claude `distance` and `evaluate_route` tools for exact numbers and what-if checks, and drive the `tool_use` → `tool_result` loop yourself
 - [x] **7. Tool runner**: replace that loop with the SDK's tool runner
-- [ ] **8. Server tools**: let Claude run code and search the web on Anthropic's side
+- [x] **8. Server tools**: let Claude run code and search the web on Anthropic's side
 
 ### Part 3: Anthropic runs the agent loop (Managed Agents)
 
