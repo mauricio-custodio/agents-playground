@@ -17,6 +17,17 @@ export function printStreamEvents(events: Anthropic.Beta.Messages.BetaRawMessage
   for (const event of events) console.log(styleText("dim", JSON.stringify(event)));
 }
 
+export function printToolResults(
+  calls: Anthropic.Beta.BetaToolUseBlock[],
+  results: Anthropic.Beta.BetaToolResultBlockParam[],
+) {
+  results.forEach((result, i) => {
+    const text = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
+    const shown = text.length > 300 ? `${text.slice(0, 300)}…` : text;
+    console.log(styleText(result.is_error ? "red" : "dim", `  ↳ ${calls[i].name}: ${shown}`));
+  });
+}
+
 export function printRaw(label: string, value: unknown) {
   // Very long strings, like the dataset, are cut short on screen only. The
   // API always receives them in full.

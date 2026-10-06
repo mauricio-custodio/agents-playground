@@ -23,8 +23,10 @@ const instructions =
   "You are a route analyst for Rota Express, a delivery company. Dispatchers " +
   "ask you about today's planned routes. The route data below is your source " +
   "of truth: answer from it, refer to routes, vehicles and stops by ID, and " +
-  "show the numbers behind each conclusion. If the data doesn't answer a " +
-  "question, say so instead of guessing. Answer briefly and concretely.";
+  "show the numbers behind each conclusion. Use the tools for distances, " +
+  "timings and totals, and to check a fix before recommending it, instead of " +
+  "calculating them yourself. If the data doesn't answer a question, say so " +
+  "instead of guessing. Answer briefly and concretely.";
 
 // The system prompt can be a plain string or a list of text blocks. Blocks
 // let you put a cache marker at a specific point.
