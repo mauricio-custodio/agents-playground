@@ -1,16 +1,22 @@
-// Tools (stage 6): functions your code runs when Claude asks for them.
+// Tools: functions your code runs when Claude asks for them (stage 6),
+// defined for the SDK's tool runner (stage 7).
 //
 // A tool is a name, a description and a JSON Schema for its input. Claude
 // never runs anything itself. When it wants a tool, it ends its response
 // with stop_reason "tool_use" and one or more tool_use blocks, each with an
-// id, the tool name and the input. Your code runs the function and sends the
-// output back as a tool_result block with the same id. Then Claude continues,
-// and may ask for more tools. That back and forth is the loop in chat.ts.
+// id, the tool name and the input. The function runs on your side and its
+// output goes back as a tool_result block with the same id.
+//
+// betaZodTool keeps everything about a tool in one place: the definition sent
+// to the API (its JSON Schema is generated from the Zod schema), the check of
+// the input Claude sends, and the function that runs. In stage 6 these were
+// three separate pieces: a hand-written JSON Schema, a Zod schema, and a
+// switch on the tool name.
 //
 // These two tools do what Claude can't do reliably by reading the data:
 // exact arithmetic, and testing a change before recommending it.
 
-import type Anthropic from "@anthropic-ai/sdk";
+import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { z } from "zod";
 import { routeData, type Stop } from "./data.ts";
 
@@ -18,107 +24,61 @@ import { routeData, type Stop } from "./data.ts";
 const ROAD_FACTOR = 1.35; // roads run about 35% longer than a straight line
 const AVG_KMH = 22;
 
-// Tool definitions, sent with every request. The description is what Claude
-// reads to decide when to call a tool, so say *when* to use it, not just what
-// it does. Tools render first in the prompt (tools → system → messages), so
-// they're part of the cached prefix: keep them identical between requests.
-export const tools: Anthropic.Beta.BetaTool[] = [
-  {
-    name: "distance",
-    description:
-      "Road distance and drive time between two places. Call this whenever an " +
-      "answer depends on how far apart two places are or how long the drive " +
-      "takes. Don't estimate distances from coordinates yourself.",
-    input_schema: {
-      type: "object",
-      properties: {
-        from: { type: "string", description: "A stop ID such as S101, or DEPOT" },
-        to: { type: "string", description: "A stop ID such as S101, or DEPOT" },
-      },
-      required: ["from", "to"],
-      additionalProperties: false,
-    },
-    // Streams the input as Claude writes it instead of buffering it on the
-    // server. The server then doesn't validate it, so runTool() does.
-    eager_input_streaming: true,
-  },
-  {
-    name: "evaluate_route",
-    description:
-      "Recalculates a route with the travel model: arrival and wait at each " +
-      "stop, late stops, load against capacity, road km, and return time " +
-      "against the driver's shift. Call it before stating any total or timing " +
-      "for a route. Without stop_order it evaluates the plan as it is. With " +
-      "stop_order it simulates a change: reorder stops, move in stops from " +
-      "another route, or add unassigned deliveries. Use it to check a fix " +
-      "before recommending it. Nothing is saved.",
-    input_schema: {
-      type: "object",
-      properties: {
-        route_id: { type: "string", description: "R1 to R4; sets the vehicle, driver and start time" },
-        stop_order: {
-          type: "array",
-          items: { type: "string" },
-          description: "Stop IDs in the order to visit them. Omit to use the current plan.",
-        },
-      },
-      required: ["route_id"],
-      additionalProperties: false,
-    },
-    eager_input_streaming: true,
-  },
-];
-
-// The same inputs as Zod schemas, for checking what Claude actually sent.
-// Writing each schema twice is the price of a hand-built loop; stage 7's
-// tool runner derives the JSON Schema from the Zod one.
-const DistanceInput = z.object({ from: z.string(), to: z.string() });
-const EvaluateRouteInput = z.object({ route_id: z.string(), stop_order: z.array(z.string()).optional() });
-
-// A problem Claude can fix by calling the tool differently.
-class ToolError extends Error {}
-
-export function runTool(call: Anthropic.Beta.BetaToolUseBlock): Anthropic.Beta.BetaToolResultBlockParam {
-  try {
-    const output = execute(call.name, call.input);
-    // Content is usually text; JSON is easy for Claude to read and cite.
-    return { type: "tool_result", tool_use_id: call.id, content: JSON.stringify(output) };
-  } catch (error) {
-    if (!(error instanceof ToolError)) throw error;
-    // is_error tells Claude the call failed. A clear message lets it retry
-    // with better input or explain the problem.
-    return { type: "tool_result", tool_use_id: call.id, content: error.message, is_error: true };
-  }
-}
-
-function execute(name: string, input: unknown) {
-  if (name === "distance") {
-    const { from, to } = validate(DistanceInput, input);
+// The description is what Claude reads to decide when to call a tool, so say
+// *when* to use it, not just what it does. Tools render first in the prompt
+// (tools → system → messages), so they're part of the cached prefix: keep
+// them identical between requests.
+const distance = betaZodTool({
+  name: "distance",
+  description:
+    "Road distance and drive time between two places. Call this whenever an " +
+    "answer depends on how far apart two places are or how long the drive " +
+    "takes. Don't estimate distances from coordinates yourself.",
+  inputSchema: z.object({
+    from: z.string().describe("A stop ID such as S101, or DEPOT"),
+    to: z.string().describe("A stop ID such as S101, or DEPOT"),
+  }),
+  // run() only gets input that passed the Zod check, already typed. What it
+  // returns becomes the tool_result content. If it throws, the runner sends
+  // the error message back as an is_error result instead of crashing.
+  run: async ({ from, to }) => {
     const leg = travel(place(from), place(to));
-    return { from, to, road_km: round1(leg.km), drive_min: leg.min };
-  }
-  if (name === "evaluate_route") {
-    const { route_id, stop_order } = validate(EvaluateRouteInput, input);
-    return evaluateRoute(route_id, stop_order);
-  }
-  throw new ToolError(`Unknown tool: ${name}`);
-}
+    return JSON.stringify({ from, to, road_km: round1(leg.km), drive_min: leg.min });
+  },
+});
 
-function validate<T>(schema: z.ZodType<T>, input: unknown): T {
-  const parsed = schema.safeParse(input);
-  // The documented convention for input that doesn't fit the schema: send
-  // the raw input back under INVALID_JSON so Claude can see what went wrong.
-  if (!parsed.success) throw new ToolError(JSON.stringify({ INVALID_JSON: JSON.stringify(input) }));
-  return parsed.data;
-}
+const evaluateRoute = betaZodTool({
+  name: "evaluate_route",
+  description:
+    "Recalculates a route with the travel model: arrival and wait at each " +
+    "stop, late stops, load against capacity, road km, and return time " +
+    "against the driver's shift. Call it before stating any total or timing " +
+    "for a route. Without stop_order it evaluates the plan as it is. With " +
+    "stop_order it simulates a change: reorder stops, move in stops from " +
+    "another route, or add unassigned deliveries. Use it to check a fix " +
+    "before recommending it. Nothing is saved.",
+  inputSchema: z.object({
+    route_id: z.string().describe("R1 to R4; sets the vehicle, driver and start time"),
+    stop_order: z
+      .array(z.string())
+      .describe("Stop IDs in the order to visit them. Omit to use the current plan.")
+      .optional(),
+  }),
+  run: async ({ route_id, stop_order }) => JSON.stringify(evaluate(route_id, stop_order)),
+});
 
-function evaluateRoute(routeId: string, stopOrder?: string[]) {
+// eager_input_streaming isn't an option of betaZodTool, so it's added to the
+// finished definitions. It streams each input as Claude writes it; the server
+// then skips its own check of the input, and the Zod check above covers it.
+export const tools = [distance, evaluateRoute].map((tool) => ({ ...tool, eager_input_streaming: true }));
+
+function evaluate(routeId: string, stopOrder?: string[]) {
   const route = routeData.routes.find((r) => r.id === routeId);
-  if (!route) throw new ToolError(`Unknown route ${routeId}. Routes: ${routeData.routes.map((r) => r.id).join(", ")}`);
+  if (!route) throw new Error(`Unknown route ${routeId}. Routes: ${routeData.routes.map((r) => r.id).join(", ")}`);
   const vehicle = routeData.vehicles.find((v) => v.id === route.vehicle_id)!;
 
   const ids = stopOrder ?? route.stops.map((s) => s.stop_id);
-  if (new Set(ids).size !== ids.length) throw new ToolError("stop_order lists a stop more than once");
+  if (new Set(ids).size !== ids.length) throw new Error("stop_order lists a stop more than once");
   const stops = ids.map(findStop);
 
   let clock = minutes(route.planned_start);
@@ -168,14 +128,14 @@ function evaluateRoute(routeId: string, stopOrder?: string[]) {
 
 function findStop(id: string): Stop {
   const stop = [...routeData.routes.flatMap((r) => r.stops), ...routeData.unassigned].find((s) => s.stop_id === id);
-  if (!stop) throw new ToolError(`Unknown stop ${id}`);
+  if (!stop) throw new Error(`Unknown stop ${id}`);
   return stop;
 }
 
 function place(id: string): { lat: number; lng: number } {
   if (id.toUpperCase() === "DEPOT") return routeData.depot;
   const stop = findStop(id);
-  if (stop.lat === null || stop.lng === null) throw new ToolError(`Stop ${id} has no coordinates: ${stop.reason ?? "unknown location"}`);
+  if (stop.lat === null || stop.lng === null) throw new Error(`Stop ${id} has no coordinates: ${stop.reason ?? "unknown location"}`);
   return { lat: stop.lat, lng: stop.lng };
 }
 

@@ -1,6 +1,6 @@
 // Chat turns: the conversation history (stage 2), streaming and visible
 // thinking (stage 3), caching the growing history (stage 4), and the tool
-// loop (stage 6).
+// loop (stage 6), now run by the SDK's tool runner (stage 7).
 //
 // The API is stateless: it doesn't remember anything between calls. A
 // "conversation" is an array of messages that you keep and send in full on
@@ -18,7 +18,7 @@ import { client, fallbackParams, MODEL } from "./client.ts";
 import { printRequest, printStreamEvents, printToolResults, printUsage, seconds } from "./output.ts";
 import { system } from "./prompt.ts";
 import { settings } from "./settings.ts";
-import { runTool, tools } from "./tools.ts";
+import { tools } from "./tools.ts";
 
 // The conversation history. It lives in your process; the API never stores it.
 const messages: Anthropic.Beta.BetaMessageParam[] = [];
@@ -29,65 +29,15 @@ let turnCount = 0;
 const MAX_ROUNDS = 10;
 
 export async function turn(userText: string) {
-  // Where this turn starts, so a failed turn can be removed as a whole.
-  const turnStart = messages.length;
-  messages.push({ role: "user", content: userText });
   const timing = { startedAt: performance.now(), firstOutputAt: undefined as number | undefined };
+  let rounds = 0;
 
-  // The agentic loop: call the API. If Claude asked for tools, run them, send
-  // the results back and call again. The turn ends when Claude answers
-  // without asking for a tool.
-  for (let round = 1; round <= MAX_ROUNDS; round++) {
-    const response = await request(timing);
-    if (!response) {
-      // Drop the whole unfinished turn, tool calls included. Only this turn's
-      // messages at the end are removed, so earlier turns stay untouched.
-      messages.length = turnStart;
-      return;
-    }
-
-    // Append the assistant's full content, not just its text. Opus 5.5 ties
-    // each thinking block to the conversation that produced it, so blocks
-    // must go back unchanged. Treat the history as append-only: if you edit
-    // or delete an earlier turn, its thinking blocks become invalid, and
-    // newer accounts get a 400 error. tool_use blocks must go back too: each
-    // tool_result has to answer a tool_use in the message before it.
-    const content = contentForHistory(response.content);
-    messages.push({ role: "assistant", content });
-
-    const calls = content.filter((b): b is Anthropic.Beta.BetaToolUseBlock => b.type === "tool_use");
-    if (response.stop_reason !== "tool_use") {
-      // A tool call cut off by max_tokens can still look complete, so tools
-      // only ever run when stop_reason is "tool_use".
-      if (calls.length > 0) {
-        console.error("\nA tool call was cut off (max_tokens), so this turn was dropped.");
-        messages.length = turnStart;
-        return;
-      }
-      turnCount++;
-      const firstOutput = timing.firstOutputAt ? `${seconds(timing.firstOutputAt - timing.startedAt)} to first output, ` : "";
-      const total = seconds(performance.now() - timing.startedAt);
-      const cutOff = response.stop_reason === "max_tokens" ? " · CUT OFF (max_tokens)" : "";
-      console.log(`\n[turn ${turnCount} · effort ${settings.effort} · ${round} requests · ${firstOutput}${total} total${cutOff}]`);
-      return;
-    }
-
-    // Run every tool call in the response. Claude can ask for several at once
-    // (parallel tool use): all the results go back together in one user
-    // message, each matched to its call by tool_use_id.
-    const results = calls.map(runTool);
-    printToolResults(calls, results);
-    messages.push({ role: "user", content: results });
-  }
-
-  console.error(`\nStopped after ${MAX_ROUNDS} requests without a final answer, so this turn was dropped.`);
-  messages.length = turnStart;
-}
-
-// One streamed API call. Returns the complete message, or null if the call
-// failed or was declined (the reason is printed).
-async function request(timing: { firstOutputAt?: number }): Promise<Anthropic.Beta.BetaMessage | null> {
-  const params: Anthropic.Beta.Messages.MessageCreateParams = {
+  // The tool runner is the stage 6 loop, packaged by the SDK. It sends a
+  // request; if Claude asked for tools, it runs them (in parallel), sends all
+  // the results back in one message, and sends again, until Claude answers
+  // without a tool call. It works on its own copy of the messages, so a turn
+  // that fails partway never touches the history.
+  let runner = client.beta.messages.toolRunner({
     model: MODEL,
 
     // Hard cap on output tokens. A streaming connection stays active while
@@ -110,7 +60,7 @@ async function request(timing: { firstOutputAt?: number }): Promise<Anthropic.Be
     tools,
 
     system, // instructions + dataset: the same bytes on every request
-    messages, // the full history, every time
+    messages: [...messages, { role: "user", content: userText }],
 
     // Breakpoint 2, automatic: the API puts a marker on the last block of the
     // request, so it moves forward as the conversation grows. Each turn then
@@ -118,73 +68,129 @@ async function request(timing: { firstOutputAt?: number }): Promise<Anthropic.Be
     cache_control: { type: "ephemeral" },
 
     ...fallbackParams,
-  };
 
-  if (settings.showRaw) printRequest(params, "  (stream: true)");
+    stream: true, // each iteration hands you a stream instead of a finished message
+    max_iterations: MAX_ROUNDS, // at most this many requests
+  });
 
   for (let attempt = 1; ; attempt++) {
-    const events: Anthropic.Beta.Messages.BetaRawMessageStreamEvent[] = [];
-    let response: Anthropic.Beta.BetaMessage;
     try {
-      // .stream() sets "stream": true in the body and returns an event iterator.
-      const stream = client.beta.messages.stream(params);
+      // One iteration per API request. The runner hands you each response
+      // before it acts on it, so the loop body can show it, check it, or
+      // change what happens next.
+      for await (const stream of runner) {
+        rounds++;
+        printLastToolResults(runner.params.messages);
+        if (settings.showRaw) {
+          const { max_iterations, ...sent } = runner.params;
+          printRequest(sent as Anthropic.Beta.Messages.MessageCreateParams);
+        }
 
-      for await (const event of stream) {
-        if (settings.showRaw) events.push(event);
+        const events: Anthropic.Beta.Messages.BetaRawMessageStreamEvent[] = [];
+        for await (const event of stream) {
+          if (settings.showRaw) events.push(event);
+          showEvent(event, timing);
+        }
+        const message = await stream.finalMessage();
+        process.stdout.write("\n");
+        if (settings.showRaw) printStreamEvents(events);
+        printUsage(message.usage);
 
-        if (event.type === "content_block_start") {
-          const block = event.content_block;
-          if (block.type === "thinking") process.stdout.write(styleText("dim", "\nthinking › "));
-          if (block.type === "text") process.stdout.write("\n\nclaude › ");
-          if (block.type === "tool_use") process.stdout.write(styleText("cyan", `\n\ntool › ${block.name} `));
-          if (block.type === "fallback") {
-            process.stdout.write(styleText("yellow", `\n[${block.from.model} declined; ${block.to.model} continues]`));
-          }
-        } else if (event.type === "content_block_delta") {
-          timing.firstOutputAt ??= performance.now();
-          if (event.delta.type === "thinking_delta") process.stdout.write(styleText("dim", event.delta.thinking));
-          if (event.delta.type === "text_delta") process.stdout.write(event.delta.text);
-          // A tool's input arrives as fragments of JSON while Claude writes it.
-          if (event.delta.type === "input_json_delta") process.stdout.write(styleText("dim", event.delta.partial_json));
+        // Stepping in: after a mid-answer fallback, hand the runner the
+        // cleaned-up response instead. pushMessages() tells it you've taken
+        // over this turn's history, so it runs the tool calls of your version.
+        if (message.stop_reason === "tool_use" && message.content.some((b) => b.type === "fallback")) {
+          runner.pushMessages({ role: "assistant", content: contentForHistory(message.content) });
         }
       }
-
-      // The SDK has been assembling the events as they arrived. finalMessage()
-      // returns the same message object a non-streaming request would.
-      response = await stream.finalMessage();
+      break;
     } catch (error) {
       // The SDK already retried rate limits (429) and server errors (5xx) twice
       // before throwing. Every error class extends Anthropic.APIError.
       if (error instanceof Anthropic.APIError) {
         console.error(`\nAPI error: ${error.message}`);
-        return null;
+        return;
       }
       // With eager input streaming the SDK parses each tool input itself and
-      // throws if the JSON can't be parsed at all. The tool_use block never
-      // completed, so there's no id to answer: the fix is to resend.
+      // throws if the JSON can't be parsed at all. A used runner can't be
+      // iterated again, so build a new one from runner.params: it holds the
+      // conversation so far, without the failed response, so it resends it.
       if (error instanceof Anthropic.AnthropicError && attempt < 3) {
         console.error(`\n${error.message}\nRetrying the request…`);
+        runner = client.beta.messages.toolRunner({ ...runner.params });
         continue;
       }
       if (error instanceof Anthropic.AnthropicError) {
         console.error(`\n${error.message}`);
-        return null;
+        return;
       }
       throw error;
     }
-    process.stdout.write("\n");
-
-    if (settings.showRaw) printStreamEvents(events);
-    printUsage(response.usage);
-
-    // Always check stop_reason before using the content. A refusal can arrive
-    // mid-stream, after part of an answer was already shown: discard that part.
-    if (response.stop_reason === "refusal") {
-      console.error("\nDeclined, so discard any partial answer above:", response.stop_details);
-      return null;
-    }
-    return response;
   }
+
+  // The runner stops on its own at any stop_reason other than "tool_use", and
+  // never runs tools after max_tokens or a refusal. Deciding what that stop
+  // means for your app is still up to you.
+  const final = await runner.done();
+  if (final.stop_reason === "refusal") {
+    console.error("\nDeclined, so discard any partial answer above:", final.stop_details);
+    return;
+  }
+  if (final.stop_reason === "tool_use") {
+    console.error(`\nStopped after ${MAX_ROUNDS} requests without a final answer, so this turn was dropped.`);
+    return;
+  }
+  // A tool call cut off by max_tokens is left without a result, and the API
+  // rejects a history like that.
+  if (final.content.some((b) => b.type === "tool_use")) {
+    console.error("\nA tool call was cut off (max_tokens), so this turn was dropped.");
+    return;
+  }
+
+  // Copy the finished turn into the history: everything in the runner's
+  // conversation after what the history already had. That includes Claude's
+  // full content (thinking blocks too: Opus 5.5 ties each one to the
+  // conversation that produced it, so they go back unchanged) and every
+  // tool_use / tool_result pair. The history is only ever appended to.
+  const turnMessages = runner.params.messages.slice(messages.length);
+  turnMessages[turnMessages.length - 1] = { role: "assistant", content: contentForHistory(final.content) };
+  messages.push(...turnMessages);
+
+  turnCount++;
+  const firstOutput = timing.firstOutputAt ? `${seconds(timing.firstOutputAt - timing.startedAt)} to first output, ` : "";
+  const total = seconds(performance.now() - timing.startedAt);
+  const cutOff = final.stop_reason === "max_tokens" ? " · CUT OFF (max_tokens)" : "";
+  console.log(`\n[turn ${turnCount} · effort ${settings.effort} · ${rounds} requests · ${firstOutput}${total} total${cutOff}]`);
+}
+
+function showEvent(event: Anthropic.Beta.Messages.BetaRawMessageStreamEvent, timing: { firstOutputAt?: number }) {
+  if (event.type === "content_block_start") {
+    const block = event.content_block;
+    if (block.type === "thinking") process.stdout.write(styleText("dim", "\nthinking › "));
+    if (block.type === "text") process.stdout.write("\n\nclaude › ");
+    if (block.type === "tool_use") process.stdout.write(styleText("cyan", `\n\ntool › ${block.name} `));
+    if (block.type === "fallback") {
+      process.stdout.write(styleText("yellow", `\n[${block.from.model} declined; ${block.to.model} continues]`));
+    }
+  } else if (event.type === "content_block_delta") {
+    timing.firstOutputAt ??= performance.now();
+    if (event.delta.type === "thinking_delta") process.stdout.write(styleText("dim", event.delta.thinking));
+    if (event.delta.type === "text_delta") process.stdout.write(event.delta.text);
+    // A tool's input arrives as fragments of JSON while Claude writes it.
+    if (event.delta.type === "input_json_delta") process.stdout.write(styleText("dim", event.delta.partial_json));
+  }
+}
+
+// The runner runs the tools between iterations and appends the results to
+// its conversation. So at the start of an iteration, the last two messages
+// are the previous round's tool calls and their results.
+function printLastToolResults(conversation: Anthropic.Beta.BetaMessageParam[]) {
+  if (conversation.length < 2) return;
+  const [calls, results] = conversation.slice(-2);
+  if (typeof calls.content === "string" || typeof results.content === "string") return;
+  const toolUses = calls.content.filter((b) => b.type === "tool_use");
+  const toolResults = results.content.filter((b) => b.type === "tool_result");
+  if (toolResults.length > 0) printToolResults(toolUses, toolResults);
 }
 
 // When a stream falls back mid-answer, its content holds the declined

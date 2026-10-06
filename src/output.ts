@@ -18,14 +18,16 @@ export function printStreamEvents(events: Anthropic.Beta.Messages.BetaRawMessage
 }
 
 export function printToolResults(
-  calls: Anthropic.Beta.BetaToolUseBlock[],
+  calls: { id: string; name: string }[],
   results: Anthropic.Beta.BetaToolResultBlockParam[],
 ) {
-  results.forEach((result, i) => {
+  for (const result of results) {
+    const name = calls.find((call) => call.id === result.tool_use_id)?.name ?? "tool";
     const text = typeof result.content === "string" ? result.content : JSON.stringify(result.content);
-    const shown = text.length > 300 ? `${text.slice(0, 300)}…` : text;
-    console.log(styleText(result.is_error ? "red" : "dim", `  ↳ ${calls[i].name}: ${shown}`));
-  });
+    const oneLine = text.replace(/\s+/g, " ");
+    const shown = oneLine.length > 300 ? `${oneLine.slice(0, 300)}…` : oneLine;
+    console.log(styleText(result.is_error ? "red" : "dim", `  ↳ ${name}: ${shown}`));
+  }
 }
 
 export function printRaw(label: string, value: unknown) {
