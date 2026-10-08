@@ -30,6 +30,7 @@ The same analyst as a Managed Agent has its own entry point:
 ```bash
 npm run agent:setup   # once: creates the environment and the agent, saves their ids to managed-agent.json
 npm run agent         # starts a session and chats with it
+npm run agent:outputs sesn_…   # downloads a session's output files again (stage 10)
 ```
 
 Run `npm run agent:setup` again after changing the agent's definition in `src/agent/config.ts`: it updates the agent to a new version instead of creating another one. In the chat, `/raw` prints every event as JSON and `exit` quits and archives the session.
@@ -52,6 +53,8 @@ Run `npm run agent:setup` again after changing the agent's definition in `src/ag
 | `src/agent/config.ts` | The agent and environment definitions, and the saved ids |
 | `src/agent/setup.ts` | Creates the environment and agent, or updates the agent to a new version |
 | `src/agent/session.ts` | One turn: send a message, follow the session's events, run custom tools |
+| `src/agent/files.ts` | Mounts the dataset into the session, downloads reports and charts to `outputs/<session id>/` |
+| `src/agent/outputs.ts` | `npm run agent:outputs <session id>`: downloads any session's output files, even after it's archived |
 
 ## Roadmap
 
@@ -74,7 +77,7 @@ Each stage builds on the one before it. The point is to see what each layer adds
 ### Part 3: Anthropic runs the agent loop (Managed Agents)
 
 - [x] **9. First managed agent**: create the agent and environment once, start a session per run, stream events
-- [ ] **10. Files in, files out**: upload the dataset, have the agent analyze it in its sandbox and return a report or chart
+- [x] **10. Files in, files out**: upload the dataset, have the agent analyze it in its sandbox and return a report or chart
 - [ ] **11. Outcomes**: give the agent a rubric and let a grader send its work back until it passes
 - [ ] **12. Going further**: memory across sessions, a scheduled nightly report, multiple agents
 
@@ -186,3 +189,13 @@ git diff stage-6 stage-7 -- src/chat.ts src/tools.ts
 - Turn on `/raw` to see each event: `session.status_running`, `agent.custom_tool_use`, `session.status_idle` with `requires_action`, then `end_turn`.
 
 **Look for:** nothing is resent between turns, because the session keeps the conversation. Each session has a $2 spending cap, and the status line shows the session's cost so far, which includes the container's running time. On `exit` the session is archived: it stays viewable in the Console, read-only.
+
+### Stage 10: files in, files out
+
+- Run `npm run agent:setup` first. It updates the environment (pandas and matplotlib are now preinstalled) and moves the agent to a new version whose system prompt no longer contains the dataset. Until you do, `npm run agent` warns that `config.ts` changed.
+- Run `npm run agent` and ask "Write a report of today's problems, with a chart of the load per van." The agent reads `/mnt/session/uploads/routes.json` with Python, saves the files to `/mnt/session/outputs/`, and your program downloads them into `outputs/<session id>/`.
+- Ask a follow-up such as "Add the R4 detour to the report." The container keeps its files during the session, so the agent edits the same report, and the new version is downloaded over the old one.
+- Ask a plain question, like "Which van is overloaded?", and watch the agent read the file first: the data is no longer in its prompt.
+- Copy the session id printed at the start (`sesn_…`) and, after you exit, run `npm run agent:outputs <session id>`. The files are still there: outputs stay in the Files API after the session is archived.
+
+**Look for:** answers now start with the agent reading the file, an extra step that stage 9 didn't need. In exchange, the data costs tokens only when it's used: if the agent pulls out just what it needs with Python, much less of the file enters the model's context than when all of it sat in the system prompt. Output files can take a second or two to show up after the turn, which is why the download retries.

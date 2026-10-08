@@ -12,18 +12,31 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { client } from "../client.ts";
-import { agentDefinition, definitionHash, environmentDefinition, loadState, saveState } from "./config.ts";
+import {
+  agentDefinition,
+  definitionHash,
+  environmentDefinition,
+  environmentHash,
+  loadState,
+  saveState,
+} from "./config.ts";
 
 try {
   const state = loadState();
   const hash = definitionHash();
+  const envHash = environmentHash();
 
   // Environment names are unique within a workspace, so look for ours first.
   let environment: Anthropic.Beta.Environments.BetaEnvironment | undefined;
   for await (const existing of client.beta.environments.list()) {
     if (existing.name === environmentDefinition.name && !existing.archived_at) environment = existing;
   }
-  if (environment) {
+  if (environment && state?.environment_hash !== envHash) {
+    // Environments aren't versioned like agents. An update applies to
+    // containers created from now on; running sessions keep the old setup.
+    environment = await client.beta.environments.update(environment.id, environmentDefinition);
+    console.log(`updated environment ${environment.id}`);
+  } else if (environment) {
     console.log(`environment ${environment.id} already exists`);
   } else {
     environment = await client.beta.environments.create(environmentDefinition);
@@ -47,7 +60,13 @@ try {
     console.log(`agent ${agentId} is up to date (version ${version})`);
   }
 
-  saveState({ environment_id: environment.id, agent_id: agentId, agent_version: version, definition_hash: hash });
+  saveState({
+    environment_id: environment.id,
+    agent_id: agentId,
+    agent_version: version,
+    definition_hash: hash,
+    environment_hash: envHash,
+  });
   console.log("Saved the ids to managed-agent.json. Start a session with: npm run agent");
 } catch (error) {
   if (!(error instanceof Anthropic.APIError)) throw error;

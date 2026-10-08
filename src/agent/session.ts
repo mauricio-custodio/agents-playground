@@ -15,12 +15,15 @@ import { client } from "../client.ts";
 import { printRaw, seconds } from "../output.ts";
 import { settings } from "../settings.ts";
 import { tools } from "../tools.ts";
+import { OUTPUTS_DIR } from "./config.ts";
+import { saveSessionOutputs } from "./files.ts";
 
 type SessionEvent = Anthropic.Beta.Sessions.BetaManagedAgentsStreamSessionEvents;
 
 export async function runTurn(sessionId: string, text: string) {
   const startedAt = performance.now();
   const usage = { requests: 0, input: 0, output: 0, cacheRead: 0 };
+  let touchedOutputs = false; // did a tool call this turn work in the outputs folder?
 
   // Stream first. The stream only delivers events from the moment it opens,
   // so open it before sending, or the first events of the turn are missed.
@@ -34,6 +37,7 @@ export async function runTurn(sessionId: string, text: string) {
     showEvent(event);
 
     if (event.type === "agent.custom_tool_use") await answerCustomTool(sessionId, event);
+    if (event.type === "agent.tool_use" && JSON.stringify(event.input).includes(OUTPUTS_DIR)) touchedOutputs = true;
 
     // Each model request the agent makes ends with its token usage.
     if (event.type === "span.model_request_end") {
@@ -67,6 +71,8 @@ export async function runTurn(sessionId: string, text: string) {
     `\n[${usage.requests} model requests · ${usage.input} in + ${usage.cacheRead} cache read / ${usage.output} out · ` +
       `${seconds(performance.now() - startedAt)} · session so far ${cost}]`,
   );
+
+  await saveSessionOutputs(sessionId, touchedOutputs);
 }
 
 // Custom tools run here, in your program, not in the container. The agent

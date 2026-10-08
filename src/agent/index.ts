@@ -3,10 +3,14 @@
 //   npm run agent:setup   creates the environment and the agent (run once,
 //                         and again after changing config.ts)
 //   npm run agent         starts a session and chats with it
+//   npm run agent:outputs <session id>
+//                         downloads a session's output files again
 //
 //   config.ts   the agent and environment definitions, and the saved ids
 //   setup.ts    creates or updates them (stage 9)
 //   session.ts  one turn: send a message, follow the session's events (stage 9)
+//   files.ts    the dataset mounted in, reports and charts downloaded out (stage 10)
+//   outputs.ts  the agent:outputs command (stage 10)
 //   index.ts    this chat loop: one session per run
 //
 // Commands: /raw toggles printing every event as JSON; exit quits (or Ctrl+D).
@@ -15,13 +19,18 @@ import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "node:readline";
 import { client } from "../client.ts";
 import { toggleRaw } from "../settings.ts";
-import { loadState } from "./config.ts";
+import { definitionHash, environmentHash, loadState } from "./config.ts";
+import { routeDataResource } from "./files.ts";
 import { runTurn } from "./session.ts";
 
 const state = loadState();
 if (!state) {
   console.error("No agent yet. Create it first with: npm run agent:setup");
   process.exit(1);
+}
+// The session uses the agent as setup last saved it, not config.ts as it is now.
+if (state.definition_hash !== definitionHash() || state.environment_hash !== environmentHash()) {
+  console.warn("config.ts changed since the last setup. Run npm run agent:setup to update the agent.");
 }
 
 // A session is one run of the agent: its own container, conversation and
@@ -33,6 +42,9 @@ try {
     agent: { type: "agent", id: state.agent_id, version: state.agent_version },
     environment_id: state.environment_id,
     title: "Route analyst chat",
+    // Files, repositories or memory stores to attach to the container. They
+    // are checked when the session is created, so a bad file id fails here.
+    resources: [await routeDataResource()],
     // A hard spending cap, at list prices, in cents: "200" is $2.00. At the
     // cap the session pauses instead of spending more.
     budget: { type: "limit", max_list_cost: { amount: "200", currency: "USD" } },

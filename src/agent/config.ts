@@ -7,14 +7,24 @@
 //
 // An *environment* is the template for the container where the agent's tools
 // run: bash, file edits and code run there, not on your machine.
+//
+// Stage 10 moves the dataset out of the system prompt: each session mounts
+// it as a file instead, and the agent writes its reports and charts to an
+// outputs folder that your program downloads (see files.ts).
 
 import type Anthropic from "@anthropic-ai/sdk";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import { MODEL } from "../client.ts";
-import { routeDataText } from "../data.ts";
 import { toolInputSchemas, tools } from "../tools.ts";
+
+// Where things are inside the session's container. Mounted files land under
+// /mnt/session/uploads/ and are read-only. Whatever the agent writes to
+// /mnt/session/outputs/ is captured and can be downloaded afterwards.
+export const DATA_MOUNT = "/routes.json";
+export const DATA_PATH = `/mnt/session/uploads${DATA_MOUNT}`;
+export const OUTPUTS_DIR = "/mnt/session/outputs/";
 
 export const environmentDefinition: Anthropic.Beta.Environments.EnvironmentCreateParams = {
   name: "route-analyst",
@@ -23,28 +33,37 @@ export const environmentDefinition: Anthropic.Beta.Environments.EnvironmentCreat
     // No internet from the container, except package registries (pip, npm).
     // Web search and fetch aren't affected: they run on Anthropic's servers.
     networking: { type: "limited", allow_package_managers: true },
+    // Installed in every new container of this environment, so the agent
+    // doesn't have to pip install them at the start of each session.
+    packages: { type: "packages", pip: ["pandas", "matplotlib"] },
   },
 };
 
 const instructions =
   "You are a route analyst for Rota Express, a delivery company. Dispatchers " +
-  "ask you about today's planned routes. The route data below is your source " +
-  "of truth: answer from it, refer to routes, vehicles and stops by ID, and " +
-  "show the numbers behind each conclusion. Use the distance and " +
-  "evaluate_route tools for distances, timings and totals, and to check a fix " +
-  "before recommending it, instead of calculating them yourself. You also " +
-  "have a Linux workspace with bash and file tools, and web search for " +
+  `ask you about today's planned routes. Today's route data is the JSON file ` +
+  `${DATA_PATH}: it's your source of truth, so read it before answering. ` +
+  "Refer to routes, vehicles and stops by ID, and show the numbers behind " +
+  "each conclusion. Use the distance and evaluate_route tools for distances, " +
+  "timings and totals, and to check a fix before recommending it, instead of " +
+  "calculating them yourself. You also have a Linux workspace with bash, " +
+  "Python (with pandas and matplotlib) and file tools, and web search for " +
   "real-world conditions in São Paulo on the service date, such as traffic, " +
-  "weather or events. If the data doesn't answer a question, say so instead " +
-  "of guessing. Answer briefly and concretely.";
+  "weather or events. When the dispatcher asks for a report or a chart, save " +
+  `it in ${OUTPUTS_DIR} (Markdown for reports, PNG for charts): files there ` +
+  "are delivered to the dispatcher. If the data doesn't answer a question, " +
+  "say so instead of guessing. Answer briefly and concretely.";
 
 export const agentDefinition: Anthropic.Beta.Agents.AgentCreateParams = {
   name: "Route analyst",
   // The model can be an object, to set the effort the agent runs at.
   model: { id: MODEL, effort: "medium" },
   // The agent keeps its own system prompt. Prompt caching happens
-  // automatically in sessions, so there are no cache markers to place.
-  system: `${instructions}\n\n<route_data>\n${routeDataText}</route_data>`,
+  // automatically in sessions, so there are no cache markers to place. The
+  // dataset isn't in it anymore: the agent reads the mounted file when it
+  // needs the data, and can work through it with Python instead of holding
+  // all of it in its context.
+  system: instructions,
   tools: [
     // The prebuilt toolset: bash, read, write, edit, glob, grep, web_fetch and
     // web_search. Anthropic runs them: the file and shell tools in the
@@ -83,7 +102,9 @@ export interface AgentState {
   environment_id: string;
   agent_id: string;
   agent_version: number;
-  definition_hash: string; // lets setup tell whether the definition changed
+  // Let setup tell whether a definition changed since it last ran.
+  definition_hash: string;
+  environment_hash?: string; // added in stage 10
 }
 
 const STATE_FILE = new URL("../../managed-agent.json", import.meta.url);
@@ -97,5 +118,11 @@ export function saveState(state: AgentState) {
 }
 
 export function definitionHash() {
-  return createHash("sha256").update(JSON.stringify(agentDefinition)).digest("hex").slice(0, 12);
+  return hash(agentDefinition);
 }
+
+export function environmentHash() {
+  return hash(environmentDefinition);
+}
+
+const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 12);
