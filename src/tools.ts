@@ -28,16 +28,18 @@ const AVG_KMH = 22;
 // *when* to use it, not just what it does. Tools render first in the prompt
 // (tools → system → messages), so they're part of the cached prefix: keep
 // them identical between requests.
+const distanceInput = z.object({
+  from: z.string().describe("A stop ID such as S101, or DEPOT"),
+  to: z.string().describe("A stop ID such as S101, or DEPOT"),
+});
+
 const distance = betaZodTool({
   name: "distance",
   description:
     "Road distance and drive time between two places. Call this whenever an " +
     "answer depends on how far apart two places are or how long the drive " +
     "takes. Don't estimate distances from coordinates yourself.",
-  inputSchema: z.object({
-    from: z.string().describe("A stop ID such as S101, or DEPOT"),
-    to: z.string().describe("A stop ID such as S101, or DEPOT"),
-  }),
+  inputSchema: distanceInput,
   // run() only gets input that passed the Zod check, already typed. What it
   // returns becomes the tool_result content. If it throws, the runner sends
   // the error message back as an is_error result instead of crashing.
@@ -45,6 +47,14 @@ const distance = betaZodTool({
     const leg = travel(place(from), place(to));
     return JSON.stringify({ from, to, road_km: round1(leg.km), drive_min: leg.min });
   },
+});
+
+const evaluateRouteInput = z.object({
+  route_id: z.string().describe("R1 to R4; sets the vehicle, driver and start time"),
+  stop_order: z
+    .array(z.string())
+    .describe("Stop IDs in the order to visit them. Omit to use the current plan.")
+    .optional(),
 });
 
 const evaluateRoute = betaZodTool({
@@ -57,13 +67,7 @@ const evaluateRoute = betaZodTool({
     "stop_order it simulates a change: reorder stops, move in stops from " +
     "another route, or add unassigned deliveries. Use it to check a fix " +
     "before recommending it. Nothing is saved.",
-  inputSchema: z.object({
-    route_id: z.string().describe("R1 to R4; sets the vehicle, driver and start time"),
-    stop_order: z
-      .array(z.string())
-      .describe("Stop IDs in the order to visit them. Omit to use the current plan.")
-      .optional(),
-  }),
+  inputSchema: evaluateRouteInput,
   run: async ({ route_id, stop_order }) => JSON.stringify(evaluate(route_id, stop_order)),
 });
 
@@ -71,6 +75,13 @@ const evaluateRoute = betaZodTool({
 // finished definitions. It streams each input as Claude writes it; the server
 // then skips its own check of the input, and the Zod check above covers it.
 export const tools = [distance, evaluateRoute].map((tool) => ({ ...tool, eager_input_streaming: true }));
+
+// Each tool's input schema by tool name, for declaring the same tools where
+// betaZodTool doesn't apply, like on the managed agent (stage 9).
+export const toolInputSchemas: Record<string, z.ZodType> = {
+  distance: distanceInput,
+  evaluate_route: evaluateRouteInput,
+};
 
 function evaluate(routeId: string, stopOrder?: string[]) {
   const route = routeData.routes.find((r) => r.id === routeId);

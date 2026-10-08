@@ -13,6 +13,9 @@
 //   settings.ts  effort and the raw view, changed by commands
 //   output.ts    printing raw JSON, usage and cost
 //
+// The same analyst as a Managed Agent (stage 9 on) lives in src/agent/, with
+// its own entry point: npm run agent.
+//
 // Run:  npm start   then type.
 //   /audit           lists every problem in the data as structured JSON
 //   /effort <level>  low | medium | high | xhigh | max (starts at low)

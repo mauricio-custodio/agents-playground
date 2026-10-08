@@ -23,6 +23,17 @@ npm start              # then type a question
 
 After every answer, a status line shows the requests made, the timing, the prompt split into cache read, cache write and uncached tokens, and the estimated cost.
 
+### The managed agent (Part 3)
+
+The same analyst as a Managed Agent has its own entry point:
+
+```bash
+npm run agent:setup   # once: creates the environment and the agent, saves their ids to managed-agent.json
+npm run agent         # starts a session and chats with it
+```
+
+Run `npm run agent:setup` again after changing the agent's definition in `src/agent/config.ts`: it updates the agent to a new version instead of creating another one. In the chat, `/raw` prints every event as JSON and `exit` quits and archives the session.
+
 ## Code layout
 
 | File | What it covers |
@@ -37,6 +48,10 @@ After every answer, a status line shows the requests made, the timing, the promp
 | `src/audit.ts` | `/audit`: structured output with Zod |
 | `src/settings.ts` | Effort and raw view, changed by commands |
 | `src/output.ts` | Printing raw JSON, usage and cost |
+| `src/agent/index.ts` | The managed agent's chat: one session per run |
+| `src/agent/config.ts` | The agent and environment definitions, and the saved ids |
+| `src/agent/setup.ts` | Creates the environment and agent, or updates the agent to a new version |
+| `src/agent/session.ts` | One turn: send a message, follow the session's events, run custom tools |
 
 ## Roadmap
 
@@ -58,7 +73,7 @@ Each stage builds on the one before it. The point is to see what each layer adds
 
 ### Part 3: Anthropic runs the agent loop (Managed Agents)
 
-- [ ] **9. First managed agent**: create the agent and environment once, start a session per run, stream events
+- [x] **9. First managed agent**: create the agent and environment once, start a session per run, stream events
 - [ ] **10. Files in, files out**: upload the dataset, have the agent analyze it in its sandbox and return a report or chart
 - [ ] **11. Outcomes**: give the agent a rubric and let a grader send its work back until it passes
 - [ ] **12. Going further**: memory across sessions, a scheduled nightly report, multiple agents
@@ -161,3 +176,13 @@ git diff stage-6 stage-7 -- src/chat.ts src/tools.ts
 - Type `/history` to see the `container_upload` block in your first message and the `server_tool_use` and result blocks.
 
 **Look for:** server tools never stop the turn with `tool_use`. The call and its result arrive together in the same response. The first question uploads `routes.json` through the Files API; it stays in your Anthropic workspace and is reused on later runs.
+
+### Stage 9: first managed agent
+
+- Run `npm run agent:setup`. It prints the ids it created; run it again and it reports the agent is up to date.
+- Change the instructions in `src/agent/config.ts` and run setup again: the agent moves to version 2 instead of being created again.
+- Run `npm run agent` and open the Console link it prints. Ask "Why is R3 late?" and follow the same turn in the terminal and in the Console.
+- Ask "How many km does R4 drive?". When the agent calls `distance` or `evaluate_route`, your program runs it (`custom tool ›`) and sends the result back, while `bash` and web search run on Anthropic's side (`tool ›`).
+- Turn on `/raw` to see each event: `session.status_running`, `agent.custom_tool_use`, `session.status_idle` with `requires_action`, then `end_turn`.
+
+**Look for:** nothing is resent between turns, because the session keeps the conversation. Each session has a $2 spending cap, and the status line shows the session's cost so far, which includes the container's running time. On `exit` the session is archived: it stays viewable in the Console, read-only.

@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "tsx --env-file-if-exists=.env src/index.ts",
+    "agent:setup": "tsx --env-file-if-exists=.env src/agent/setup.ts",
+    "agent": "tsx --env-file-if-exists=.env src/agent/index.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
