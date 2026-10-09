@@ -85,29 +85,20 @@ Each stage builds on the one before it. The point is to see what each layer adds
 
 ## Trying each stage
 
-Every feature stays in the app, so stages 2 to 8 can be tried on `main`. Stage 1, and a couple of experiments marked below, need the code as it was at that stage. Each stage is a git tag:
+Stages 2 to 11 all work on `main`. Stage 1, and experiments marked "on `stage-N`", need that stage's git tag:
 
 ```bash
-git checkout stage-1
+git checkout stage-1      # go back with: git checkout main
+git diff stage-3 stage-4  # see what a stage added
 ```
 
-```bash
-git checkout main
-```
+For stage 6, diff from the refactor commit instead: `git diff 26d4d1d stage-6`.
 
-To see exactly what a stage added, diff it against the one before:
-
-```bash
-git diff stage-3 stage-4
-```
-
-Between stage 5 and stage 6 there's a refactor commit (`26d4d1d`) that split the code into modules, so `git diff 26d4d1d stage-6` shows only what stage 6 added.
-
-Questions cost a few cents each at `/effort low`. The status line after each answer shows the exact amount.
+Questions cost a few cents each at `/effort low`. The status line shows the exact amount.
 
 ### The answer key
 
-The dataset has five problems built in. Use them to check whether Claude finds them:
+The dataset has five planted problems. Check Claude's answers against them:
 
 | Route | Problem |
 |---|---|
@@ -117,96 +108,88 @@ The dataset has five problems built in. Use them to check whether Claude finds t
 | R4 | S404 is in Moema, across the city from the rest of the northern route. R4 drives about 83.5 km; without S404, about 56.6 km |
 | Unassigned | S501 (no van with room), S502 (address couldn't be geocoded), S503 (window ends before any route can reach it) |
 
-### Stage 1: first call
-
-Needs `git checkout stage-1`.
+### Stage 1: first call (on `stage-1`)
 
 - Run `npm start -- "What makes a delivery route efficient?"`.
-- Change `effort` in `src/index.ts` to `"low"`, then `"high"`, and compare `tokens` and `cost`.
+- Set `effort` in `src/index.ts` to `"low"`, then `"high"`, and compare `tokens` and `cost`.
 
-**Look for:** `blocks: thinking, text`. There's a thinking block even though its text is empty: Opus 5.5 always reasons before answering, and the reasoning is billed as output tokens.
+**Look for:** `blocks: thinking, text`. The thinking block is there even when empty, and it's billed as output tokens.
 
 ### Stage 2: chat loop
 
-- Ask a question, then a follow-up that only makes sense in context, like "What if one van breaks down?".
-- Type `/history` after a couple of turns.
-- Turn on `/raw` and watch the `messages` array in the request grow by your question and Claude's full reply on each turn.
-- Change the instructions in `src/prompt.ts`, for example to "Always answer in Portuguese", and restart. The system prompt applies to every turn.
-- On `stage-2`: comment out the `messages.push({ role: "assistant", ... })` line in `src/index.ts`. Claude then sees your questions but none of its own answers.
+- Ask a question, then a follow-up like "What if one van breaks down?".
+- `/history` lists what gets resent. `/raw` shows the `messages` array growing each turn.
+- Change the instructions in `src/prompt.ts` (say, "Always answer in Portuguese") and restart.
+- On `stage-2`: comment out `messages.push({ role: "assistant", ... })` in `src/index.ts`. Claude forgets its own answers.
 
-**Look for:** input tokens grow every turn, even for short questions, because the whole history is resent. In `/raw`, the thinking block has empty text but a long `signature`: Claude's reasoning in encrypted form, which is why the block has to go back unchanged.
+**Look for:** input tokens grow every turn, because the whole history is resent.
 
 ### Stage 3: streaming and thinking
 
-- Ask the same planning question at `/effort low`, then at `/effort high`. Compare the thinking summary, output tokens and total time.
-- Ask for something long, like "Write a checklist for onboarding a new driver", and compare "to first output" with "total" in the status line.
-- With `/raw` on, find the `signature_delta` that closes each thinking block, and the `message_delta` that carries `stop_reason` and the final usage.
+- Ask the same planning question at `/effort low` and `/effort high`. Compare thinking, output tokens and time.
+- Ask for something long ("Write a checklist for onboarding a new driver"). Compare "to first output" with "total".
+- In `/raw`, find `signature_delta` (ends a thinking block) and `message_delta` (`stop_reason` and final usage).
 
-**Look for:** the total time is about the same as without streaming, but you start reading much sooner.
+**Look for:** the total time barely changes, but text appears much sooner.
 
 ### Stage 4: grounding and caching
 
-- Ask two questions in a row. The first writes the instructions, tools and dataset to the cache (several thousand tokens of cache write); the second reads them back (cache read), with only a few uncached tokens.
-- Type `exit`, run `npm start` again, and ask something within 5 minutes. The first turn now reads from the cache: it's stored on Anthropic's side, not in your program.
-- Change `/effort` mid-conversation, or wait more than 5 minutes between questions, and watch the cache writes jump.
+- Ask two questions in a row. The first writes the cache, the second reads it.
+- Restart and ask again within 5 minutes. The cache lives on Anthropic's side, so it still hits.
+- Change `/effort`, or wait more than 5 minutes, and the cache is written again.
 
 **Look for:** the "without caching" cost next to the real one in the status line.
 
 ### Stage 5: structured output
 
-- Run `/audit` at `/effort low`, then at `/effort high`, and compare the results with the answer key.
-- With `/raw` on, run `/audit` and read `output_config.format` in the request: the JSON Schema generated from the Zod schema. The enums appear only as hints in `description`, so the Zod check afterwards is what enforces them.
-- Add a field to the schema in `src/audit.ts`, for example `estimated_minutes_lost: z.number()`, and run `/audit` again.
+- Run `/audit` at `/effort low` and `/effort high`. Compare with the answer key.
+- In `/raw`, read `output_config.format`: the JSON Schema built from Zod. Enums are only hints there; the Zod check enforces them.
+- Add a field in `src/audit.ts` (say, `estimated_minutes_lost: z.number()`) and run `/audit` again.
 
-**Look for:** `/audit` sends no tools, so its prompt starts differently from the chat's, and its first run writes a cache entry of its own.
+**Look for:** `/audit` sends no tools, so it writes a cache entry of its own.
 
 ### Stages 6 and 7: tools
 
-- "How many km does R4 drive, and why so far?" Claude should call `evaluate_route` and `distance`, and point to S404 (15.7 km from the depot).
-- "Fix R3's late stop." Watch Claude try stop orders with `evaluate_route` until nothing is late. The expected fix is visiting S302 before S301.
-- "Can S501 fit on any route?" This takes several simulations, possibly in parallel.
-- Type `/history` to see the `tool_use` and `tool_result` messages, and turn on `/raw` to see the exact JSON each way.
+- "How many km does R4 drive, and why so far?" Claude calls `evaluate_route` and `distance` and points to S404.
+- "Fix R3's late stop." Claude tries stop orders until S302 comes before S301.
+- "Can S501 fit on any route?" Several simulations, maybe in parallel.
+- `/history` shows the `tool_use` and `tool_result` messages; `/raw` shows the JSON.
 
-**Look for:** the number of requests in the turn's status line. Each round of tool calls is another request, each with its own cost line. Stage 7 behaves the same as stage 6; to compare the hand-written loop with the tool runner:
-
-```bash
-git diff stage-6 stage-7 -- src/chat.ts src/tools.ts
-```
+**Look for:** each round of tool calls is one more request in the status line. Stage 7 behaves the same; compare the code with `git diff stage-6 stage-7 -- src/chat.ts src/tools.ts`.
 
 ### Stage 8: server tools
 
-- "Chart each van's load against its capacity." Python runs in Anthropic's sandbox, and the chart is saved as a PNG in `outputs/`.
-- "Is anything happening in São Paulo today that could slow deliveries?" This uses web search, at $0.01 per search. The dataset's service date is 2026-10-06.
-- "Using Python, find the two stops furthest apart." Then ask a follow-up that uses files from that answer: the container, and its files, carry over between turns.
-- Type `/history` to see the `container_upload` block in your first message and the `server_tool_use` and result blocks.
+- "Chart each van's load against its capacity." Python runs on Anthropic's side and the PNG is saved to `outputs/`.
+- "Is anything happening in São Paulo today that could slow deliveries?" Web search, $0.01 per search. The dataset's date is 2026-10-06.
+- "Using Python, find the two stops furthest apart." Then ask a follow-up that reuses its files.
+- `/history` shows the `container_upload`, `server_tool_use` and result blocks.
 
-**Look for:** server tools never stop the turn with `tool_use`. The call and its result arrive together in the same response. The first question uploads `routes.json` through the Files API; it stays in your Anthropic workspace and is reused on later runs.
+**Look for:** no `tool_use` stop. The call and its result come back in the same response, and the container keeps its files between turns.
 
 ### Stage 9: first managed agent
 
-- Run `npm run agent:setup`. It prints the ids it created; run it again and it reports the agent is up to date.
-- Change the instructions in `src/agent/config.ts` and run setup again: the agent moves to version 2 instead of being created again.
-- Run `npm run agent` and open the Console link it prints. Ask "Why is R3 late?" and follow the same turn in the terminal and in the Console.
-- Ask "How many km does R4 drive?". When the agent calls `distance` or `evaluate_route`, your program runs it (`custom tool ›`) and sends the result back, while `bash` and web search run on Anthropic's side (`tool ›`).
-- Turn on `/raw` to see each event: `session.status_running`, `agent.custom_tool_use`, `session.status_idle` with `requires_action`, then `end_turn`.
+- Run `npm run agent:setup`. Run it again: the agent is up to date. Edit `src/agent/config.ts` and rerun: it moves to version 2.
+- Run `npm run agent`, open the Console link, ask "Why is R3 late?" and follow it in both places.
+- Ask "How many km does R4 drive?". `custom tool ›` runs in your program; `tool ›` runs on Anthropic's side.
+- `/raw` shows each event, from `session.status_running` to `end_turn`.
 
-**Look for:** nothing is resent between turns, because the session keeps the conversation. Each session has a spending cap ($5 since stage 11), and the status line shows the session's cost so far, which includes the container's running time. On `exit` the session is archived: it stays viewable in the Console, read-only.
+**Look for:** nothing is resent between turns, because the session keeps the conversation. The status line shows the session's cost so far (capped at $5). `exit` archives the session.
 
 ### Stage 10: files in, files out
 
-- Run `npm run agent:setup` first. It updates the environment (pandas and matplotlib are now preinstalled) and moves the agent to a new version whose system prompt no longer contains the dataset. Until you do, `npm run agent` warns that `config.ts` changed.
-- Run `npm run agent` and ask "Write a report of today's problems, with a chart of the load per van." The agent reads `/mnt/session/uploads/routes.json` with Python, saves the files to `/mnt/session/outputs/`, and your program downloads them into `outputs/<session id>/`.
-- Ask a follow-up such as "Add the R4 detour to the report." The container keeps its files during the session, so the agent edits the same report, and the new version is downloaded over the old one.
-- Ask a plain question, like "Which van is overloaded?", and watch the agent read the file first: the data is no longer in its prompt.
-- Copy the session id printed at the start (`sesn_…`) and, after you exit, run `npm run agent:outputs <session id>`. The files are still there: outputs stay in the Files API after the session is archived.
+- Run `npm run agent:setup` first, to update the environment and the agent.
+- Ask "Write a report of today's problems, with a chart of the load per van." The files download to `outputs/<session id>/`.
+- Follow up with "Add the R4 detour to the report." The agent edits the same file.
+- Ask "Which van is overloaded?" and watch the agent read the file first.
+- After `exit`, run `npm run agent:outputs <session id>`. The files outlive the session.
 
-**Look for:** answers now start with the agent reading the file, an extra step that stage 9 didn't need. In exchange, the data costs tokens only when it's used: if the agent pulls out just what it needs with Python, much less of the file enters the model's context than when all of it sat in the system prompt. Output files can take a second or two to show up after the turn, which is why the download retries.
+**Look for:** an extra file-reading step, in exchange for paying only for the data the agent actually reads.
 
 ### Stage 11: outcomes
 
-- Run `npm run agent` and type `/report`. Instead of a message, the chat sends a `user.define_outcome` event: the task, the rubric in `data/report-rubric.md`, and up to 3 checks.
-- Watch for `grader ›` lines. After each attempt, a separate grader checks the report against every criterion. On `needs_revision` it says what's missing, and the agent revises without you sending anything.
-- Make the rubric stricter, for example "Each fix was checked with the evaluate_route tool, and the report says so", and run `/report` again in a new session to see whether it takes more attempts.
-- Compare the downloaded report with the answer key above. The rubric never lists the planted problems; it only requires every route and unassigned delivery to be covered, with numbers.
+- Run `npm run agent`, then `/report`. It sends the task and the rubric in `data/report-rubric.md` as an outcome, with up to 3 checks.
+- Watch the `grader ›` lines. On `needs_revision`, the agent revises without you sending anything.
+- Make the rubric stricter (say, "Each fix was checked with evaluate_route") and run `/report` in a new session.
+- Compare the report with the answer key. The rubric never names the planted problems.
 
-**Look for:** the session stays `running` through the revisions and only goes idle once the outcome is over: `satisfied`, `max_iterations_reached`, `failed` or `interrupted`. The status line counts the grader's tokens separately: grading is billed too.
+**Look for:** the session stays `running` until the outcome ends (`satisfied`, `max_iterations_reached`, `failed` or `interrupted`). Grader tokens are billed and counted separately.
