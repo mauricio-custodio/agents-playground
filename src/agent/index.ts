@@ -11,9 +11,11 @@
 //   session.ts  one turn: send a message, follow the session's events (stage 9)
 //   files.ts    the dataset mounted in, reports and charts downloaded out (stage 10)
 //   outputs.ts  the agent:outputs command (stage 10)
+//   outcome.ts  /report: a deliverable with a rubric, checked by a grader (stage 11)
 //   index.ts    this chat loop: one session per run
 //
-// Commands: /raw toggles printing every event as JSON; exit quits (or Ctrl+D).
+// Commands: /report asks for the problems report as an outcome; /raw toggles
+// printing every event as JSON; exit quits (or Ctrl+D).
 
 import Anthropic from "@anthropic-ai/sdk";
 import * as readline from "node:readline";
@@ -21,6 +23,7 @@ import { client } from "../client.ts";
 import { toggleRaw } from "../settings.ts";
 import { definitionHash, environmentHash, loadState } from "./config.ts";
 import { routeDataResource } from "./files.ts";
+import { reportOutcome } from "./outcome.ts";
 import { runTurn } from "./session.ts";
 
 const state = loadState();
@@ -45,9 +48,10 @@ try {
     // Files, repositories or memory stores to attach to the container. They
     // are checked when the session is created, so a bad file id fails here.
     resources: [await routeDataResource()],
-    // A hard spending cap, at list prices, in cents: "200" is $2.00. At the
-    // cap the session pauses instead of spending more.
-    budget: { type: "limit", max_list_cost: { amount: "200", currency: "USD" } },
+    // A hard spending cap, at list prices, in cents: "500" is $5.00. At the
+    // cap the session pauses instead of spending more. (An outcome can take
+    // several rounds of work plus grading, so it needs more room than a chat.)
+    budget: { type: "limit", max_list_cost: { amount: "500", currency: "USD" } },
   });
 } catch (error) {
   if (!(error instanceof Anthropic.APIError)) throw error;
@@ -60,7 +64,7 @@ console.log(`Session ${session.id}. Watch it live in the Console:`);
 // "default" is the Default workspace. If your API key belongs to another
 // workspace, put that workspace's id there instead.
 console.log(`https://platform.claude.com/workspaces/default/sessions/${session.id}`);
-console.log("Commands: /raw, exit.");
+console.log("Commands: /report, /raw, exit.");
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 let inputClosed = false; // Ctrl+D can close input while a turn is running
@@ -72,18 +76,21 @@ for await (const line of rl) {
   const text = line.trim();
   if (text === "exit") break;
   else if (text === "/raw") toggleRaw();
-  else if (text) {
-    try {
-      await runTurn(session.id, text);
-    } catch (error) {
-      if (!(error instanceof Anthropic.APIError)) throw error;
-      console.error(`\nAPI error: ${error.message}`);
-    }
-  }
+  else if (text === "/report") await turn(reportOutcome());
+  else if (text) await turn({ type: "user.message", content: [{ type: "text", text }] });
   if (!inputClosed) rl.prompt();
 }
 rl.close();
 await archive(session.id);
+
+async function turn(kickoff: Anthropic.Beta.Sessions.BetaManagedAgentsEventParams) {
+  try {
+    await runTurn(session.id, kickoff);
+  } catch (error) {
+    if (!(error instanceof Anthropic.APIError)) throw error;
+    console.error(`\nAPI error: ${error.message}`);
+  }
+}
 
 // Sessions are disposable: archiving one makes it read-only (you can still
 // open it in the Console) and frees its container. Agents and environments

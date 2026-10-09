@@ -33,7 +33,7 @@ npm run agent         # starts a session and chats with it
 npm run agent:outputs sesn_…   # downloads a session's output files again (stage 10)
 ```
 
-Run `npm run agent:setup` again after changing the agent's definition in `src/agent/config.ts`: it updates the agent to a new version instead of creating another one. In the chat, `/raw` prints every event as JSON and `exit` quits and archives the session.
+Run `npm run agent:setup` again after changing the agent's definition in `src/agent/config.ts`: it updates the agent to a new version instead of creating another one. In the chat, `/report` asks for the problems report as an outcome checked against `data/report-rubric.md` (stage 11), `/raw` prints every event as JSON, and `exit` quits and archives the session. Each session has a $5 spending cap.
 
 ## Code layout
 
@@ -55,6 +55,8 @@ Run `npm run agent:setup` again after changing the agent's definition in `src/ag
 | `src/agent/session.ts` | One turn: send a message, follow the session's events, run custom tools |
 | `src/agent/files.ts` | Mounts the dataset into the session, downloads reports and charts to `outputs/<session id>/` |
 | `src/agent/outputs.ts` | `npm run agent:outputs <session id>`: downloads any session's output files, even after it's archived |
+| `src/agent/outcome.ts` | `/report`: the problems report as an outcome, and the grader's events |
+| `data/report-rubric.md` | The rubric the grader checks the report against (a starter: tune it) |
 
 ## Roadmap
 
@@ -78,7 +80,7 @@ Each stage builds on the one before it. The point is to see what each layer adds
 
 - [x] **9. First managed agent**: create the agent and environment once, start a session per run, stream events
 - [x] **10. Files in, files out**: upload the dataset, have the agent analyze it in its sandbox and return a report or chart
-- [ ] **11. Outcomes**: give the agent a rubric and let a grader send its work back until it passes
+- [x] **11. Outcomes**: give the agent a rubric and let a grader send its work back until it passes
 - [ ] **12. Going further**: memory across sessions, a scheduled nightly report, multiple agents
 
 ## Trying each stage
@@ -188,7 +190,7 @@ git diff stage-6 stage-7 -- src/chat.ts src/tools.ts
 - Ask "How many km does R4 drive?". When the agent calls `distance` or `evaluate_route`, your program runs it (`custom tool ›`) and sends the result back, while `bash` and web search run on Anthropic's side (`tool ›`).
 - Turn on `/raw` to see each event: `session.status_running`, `agent.custom_tool_use`, `session.status_idle` with `requires_action`, then `end_turn`.
 
-**Look for:** nothing is resent between turns, because the session keeps the conversation. Each session has a $2 spending cap, and the status line shows the session's cost so far, which includes the container's running time. On `exit` the session is archived: it stays viewable in the Console, read-only.
+**Look for:** nothing is resent between turns, because the session keeps the conversation. Each session has a spending cap ($5 since stage 11), and the status line shows the session's cost so far, which includes the container's running time. On `exit` the session is archived: it stays viewable in the Console, read-only.
 
 ### Stage 10: files in, files out
 
@@ -199,3 +201,12 @@ git diff stage-6 stage-7 -- src/chat.ts src/tools.ts
 - Copy the session id printed at the start (`sesn_…`) and, after you exit, run `npm run agent:outputs <session id>`. The files are still there: outputs stay in the Files API after the session is archived.
 
 **Look for:** answers now start with the agent reading the file, an extra step that stage 9 didn't need. In exchange, the data costs tokens only when it's used: if the agent pulls out just what it needs with Python, much less of the file enters the model's context than when all of it sat in the system prompt. Output files can take a second or two to show up after the turn, which is why the download retries.
+
+### Stage 11: outcomes
+
+- Run `npm run agent` and type `/report`. Instead of a message, the chat sends a `user.define_outcome` event: the task, the rubric in `data/report-rubric.md`, and up to 3 checks.
+- Watch for `grader ›` lines. After each attempt, a separate grader checks the report against every criterion. On `needs_revision` it says what's missing, and the agent revises without you sending anything.
+- Make the rubric stricter, for example "Each fix was checked with the evaluate_route tool, and the report says so", and run `/report` again in a new session to see whether it takes more attempts.
+- Compare the downloaded report with the answer key above. The rubric never lists the planted problems; it only requires every route and unassigned delivery to be covered, with numbers.
+
+**Look for:** the session stays `running` through the revisions and only goes idle once the outcome is over: `satisfied`, `max_iterations_reached`, `failed` or `interrupted`. The status line counts the grader's tokens separately: grading is billed too.

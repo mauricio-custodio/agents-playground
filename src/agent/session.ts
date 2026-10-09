@@ -1,12 +1,12 @@
-// One turn with the managed agent (stage 9): send a message, then follow the
+// One turn with the managed agent (stage 9): send an event, then follow the
 // session's events until the agent is done.
 //
 // With the Messages API, a turn was a request and its streamed response, you
 // resent the whole history each time, and your code ran the tool loop. A
 // session is different: it lives on Anthropic's side, keeps the conversation
-// itself, and runs the agent loop for you. You send events in (here a
-// user.message) and read events out: messages, tool calls and their results,
-// status changes. Nothing is resent.
+// itself, and runs the agent loop for you. You send events in (a user.message,
+// or a user.define_outcome from stage 11) and read events out: messages, tool
+// calls and their results, grading, status changes. Nothing is resent.
 
 import Anthropic from "@anthropic-ai/sdk";
 import { runRunnableTool } from "@anthropic-ai/sdk/lib/tools/BetaRunnableTool";
@@ -17,24 +17,23 @@ import { settings } from "../settings.ts";
 import { tools } from "../tools.ts";
 import { OUTPUTS_DIR } from "./config.ts";
 import { saveSessionOutputs } from "./files.ts";
+import { showOutcomeEvent } from "./outcome.ts";
 
 type SessionEvent = Anthropic.Beta.Sessions.BetaManagedAgentsStreamSessionEvents;
 
-export async function runTurn(sessionId: string, text: string) {
+export async function runTurn(sessionId: string, kickoff: Anthropic.Beta.Sessions.BetaManagedAgentsEventParams) {
   const startedAt = performance.now();
-  const usage = { requests: 0, input: 0, output: 0, cacheRead: 0 };
+  const usage = { requests: 0, input: 0, output: 0, cacheRead: 0, graderIn: 0, graderOut: 0 };
   let touchedOutputs = false; // did a tool call this turn work in the outputs folder?
 
   // Stream first. The stream only delivers events from the moment it opens,
   // so open it before sending, or the first events of the turn are missed.
   const stream = await client.beta.sessions.events.stream(sessionId);
-  await client.beta.sessions.events.send(sessionId, {
-    events: [{ type: "user.message", content: [{ type: "text", text }] }],
-  });
+  await client.beta.sessions.events.send(sessionId, { events: [kickoff] });
 
   for await (const event of stream) {
     if (settings.showRaw) printRaw(`← ${event.type}`, event);
-    showEvent(event);
+    if (!showOutcomeEvent(event)) showEvent(event);
 
     if (event.type === "agent.custom_tool_use") await answerCustomTool(sessionId, event);
     if (event.type === "agent.tool_use" && JSON.stringify(event.input).includes(OUTPUTS_DIR)) touchedOutputs = true;
@@ -45,6 +44,11 @@ export async function runTurn(sessionId: string, text: string) {
       usage.input += event.model_usage.input_tokens + event.model_usage.cache_creation_input_tokens;
       usage.cacheRead += event.model_usage.cache_read_input_tokens;
       usage.output += event.model_usage.output_tokens;
+    }
+    // The grader's work is billed too, and reported with each check.
+    if (event.type === "span.outcome_evaluation_end") {
+      usage.graderIn += event.usage.input_tokens + event.usage.cache_creation_input_tokens + event.usage.cache_read_input_tokens;
+      usage.graderOut += event.usage.output_tokens;
     }
 
     if (event.type === "session.status_terminated") {
@@ -59,7 +63,10 @@ export async function runTurn(sessionId: string, text: string) {
       if (event.stop_reason.type === "budget_reached") console.error("\nThe session reached its spending cap and paused.");
       if (event.stop_reason.type === "retries_exhausted") console.error("\nThe agent gave up after repeated errors.");
       if (event.stop_reason.type === "refusal") console.error("\nDeclined:", event.stop_details);
-      break; // end_turn: the agent has answered
+      // end_turn: the agent has answered. With an outcome, the session only
+      // goes idle once the outcome is over: while the grader asks for
+      // revisions, it keeps running.
+      break;
     }
   }
 
@@ -67,8 +74,9 @@ export async function runTurn(sessionId: string, text: string) {
   // includes the container's running time, not just tokens.
   const session = await client.beta.sessions.retrieve(sessionId);
   const cost = session.usage.list_cost ? `$${(Number(session.usage.list_cost.amount) / 100).toFixed(2)}` : "n/a";
+  const grader = usage.graderIn ? ` · grader ${usage.graderIn} in / ${usage.graderOut} out` : "";
   console.log(
-    `\n[${usage.requests} model requests · ${usage.input} in + ${usage.cacheRead} cache read / ${usage.output} out · ` +
+    `\n[${usage.requests} model requests · ${usage.input} in + ${usage.cacheRead} cache read / ${usage.output} out${grader} · ` +
       `${seconds(performance.now() - startedAt)} · session so far ${cost}]`,
   );
 
