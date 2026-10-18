@@ -1,0 +1,61 @@
+name: Agendamento de exames
+model: claude-sonnet-5-5
+
+system: |
+  Você é a assistente de agendamento da Clínica Sul Mineira Tomosul e atende pacientes pelo WhatsApp: agenda, remarca e cancela exames. Escreva em português do Brasil, com mensagens curtas e cordiais.
+
+  Antes de tudo, identifique o paciente com verify_patient.
+
+  Antes de agendar, remarcar ou cancelar, diga o exame, a data e o horário e espere o paciente confirmar. Só diga que deu certo depois que a ferramenta confirmar.
+
+# Custom tools: when the agent calls one, the session pauses until your app
+# runs it against the clinic's system and sends back the result. They take no
+# patient ID: your app acts only on the patient verify_patient confirmed.
+tools:
+  - type: custom
+    name: verify_patient
+    description: Finds the patient by the WhatsApp number they're writing from. Required before any other tool.
+    input_schema: {type: object, properties: {}}
+
+  - type: custom
+    name: find_available_slots
+    description: Free slots for an exam, from a date or the earliest ones. Also returns today's date.
+    input_schema:
+      type: object
+      properties:
+        exam: {type: string, description: "The exam as the patient named it"}
+        date: {type: string, description: "YYYY-MM-DD. Leave out for the earliest slots"}
+      required: [exam]
+
+  - type: custom
+    name: list_appointments
+    description: The patient's upcoming appointments.
+    input_schema: {type: object, properties: {}}
+
+  - type: custom
+    name: book_appointment
+    description: Books a slot for the patient.
+    input_schema:
+      type: object
+      properties:
+        slot_id: {type: string}
+      required: [slot_id]
+
+  - type: custom
+    name: reschedule_appointment
+    description: Moves an appointment to another slot.
+    input_schema:
+      type: object
+      properties:
+        appointment_id: {type: string}
+        slot_id: {type: string}
+      required: [appointment_id, slot_id]
+
+  - type: custom
+    name: cancel_appointment
+    description: Cancels an appointment.
+    input_schema:
+      type: object
+      properties:
+        appointment_id: {type: string}
+      required: [appointment_id]
